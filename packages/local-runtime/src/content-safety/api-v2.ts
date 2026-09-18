@@ -49,7 +49,13 @@ export async function callLocalSafetyCheckV2(input: {
 }): Promise<LocalSafetyCheckV2Result> {
   const buildEnv = (input.buildEnv ?? getRuntimeBuildEnv)();
   const region = (input.region ?? getRuntimeRegion)();
-  const token = input.authContext?.accessToken?.trim() || process.env.MAVIS_ACCESS_TOKEN?.trim();
+  // V2 intentionally drops the `MAVIS_ACCESS_TOKEN` env-var fallback that v1
+  // still honors. V2 is the joint biz-gateway path that authenticates the
+  // caller's OAuth tenant; letting any process that just sets an env var
+  // become an authenticated client lets a caller spoof a managed audience
+  // without ever holding a managed OAuth refresh token. Callers must pipe
+  // their access token through the `authContext` argument.
+  const token = input.authContext?.accessToken?.trim();
   const result = await postSafetyCheckV2({
     url: `${resolveSafetyApiBase(region, buildEnv, input.testBaseURL)}/mavis/api/v2/content?require_auth=true`,
     headers: {

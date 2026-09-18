@@ -4,7 +4,17 @@ import type { MetricsClient } from '../../src/common/metrics.js';
 
 const clients: MetricsClient[] = [];
 const fetchRequest = vi.fn<typeof fetch>();
+const originalArgv = process.argv;
 beforeEach(() => {
+  // `MAVIS_BUILD_ENV` is only honored when the runtime was launched with
+  // an explicit `--env` CLI flag (see the security fix in
+  // `packages/config/src/config.ts:getRuntimeBuildEnv`). Pin both signals
+  // so the test still observes the prod endpoint.
+  Object.defineProperty(process, 'argv', {
+    value: [originalArgv[0]!, 'mavis', '--env', 'prod'],
+    writable: true,
+    configurable: true,
+  });
   vi.stubEnv('__MAVIS_RUNTIME_MANAGED', '1');
   vi.stubEnv('MAVIS_BUILD_ENV', 'prod');
   vi.stubEnv('MAVIS_REGION', 'en');
@@ -17,6 +27,11 @@ afterEach(async () => {
   for (const client of clients.splice(0)) await client.close();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+  Object.defineProperty(process, 'argv', {
+    value: originalArgv,
+    writable: true,
+    configurable: true,
+  });
 });
 
 function fixture(metrics?: boolean) {
