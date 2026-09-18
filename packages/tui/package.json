@@ -22,6 +22,7 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "1.3.0",
     "@earendil-works/pi-coding-agent": "workspace:*",
+    "@mavis/agent-core": "workspace:^",
     "@mavis/agent-tools": "workspace:^",
     "@mavis/browser-core": "workspace:^",
     "@mavis/config": "workspace:^",

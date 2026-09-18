@@ -105,6 +105,14 @@ export const BASH_SUBPROCESS_SCRUB: readonly string[] = [
   'FIGMA_API_TOKEN',
   'FIGMA_TOKEN',
   'E2E_AUTH_TOKEN',
+  // Desktop-managed Matrix backend token — parent uses it for tool/LLM
+  // calls; a child ripgrep/git/restart should never see it.
+  'MATRIX_TOKEN',
+  // Unprefixed access-token fallback (the supported entry point is the
+  // __MAVIS_PARENT_ACCESS_TOKEN hint, but Layer A strips it for the parent
+  // runtime; this duplicate protects any subprocess that is asked to
+  // bypass the Layer A strip by overriding mode).
+  'MAVIS_ACCESS_TOKEN',
 ];
 
 /**
@@ -151,17 +159,23 @@ function isProtectedName(name: string): boolean {
   return PROTECTED_ENV_NAMES.has(upper) || upper.startsWith('LC_');
 }
 
-function isEnvTruthy(value: string | undefined): boolean {
-  if (!value) return false;
-  return !['0', 'false', 'no', 'off'].includes(value.toLowerCase());
-}
-
 const VALID_MODES: ReadonlySet<string> = new Set(['off', 'scrub', 'strict']);
 
 /**
  * Resolve the effective Layer B policy. Precedence: explicit override >
- * `MAVIS_BASH_ENV_SANITIZE` env switch > auto (CI markers → `scrub`,
- * otherwise `off` — interactive default, reference CLI parity).
+ * `MAVIS_BASH_ENV_SANITIZE` env switch > auto (default → `scrub`).
+ *
+ * Security default is `scrub` for desktop launches: passing `process.env`
+ * straight through to a child shell would leak
+ * `MAVIS_ACCESS_TOKEN` / `MATRIX_TOKEN` / `GITHUB_TOKEN` / `*_API_KEY` etc.
+ * into any subprocess the agent spawns. The `scrub` blocklist drops these
+ * without affecting ordinary user tooling (gh CLI, npm, etc. — see
+ * `BASH_SUBPROCESS_SCRUB` rationale).
+ *
+ * Callers who explicitly opt out (legacy scripts, controlled testing
+ * harnesses) must set `MAVIS_BASH_ENV_SANITIZE=off` or pass
+ * `{ mode: 'off' }` as the override — there is no implicit "off" path so a
+ * missing env switch never silently disables scrubbing on a desktop launch.
  */
 export function resolveBashEnvPolicy(
   overrides?: Partial<BashEnvPolicy>,
@@ -172,10 +186,8 @@ export function resolveBashEnvPolicy(
     const explicit = envSource.MAVIS_BASH_ENV_SANITIZE?.trim().toLowerCase();
     if (explicit && VALID_MODES.has(explicit)) {
       mode = explicit as BashEnvSanitizeMode;
-    } else if (isEnvTruthy(envSource.CI) || isEnvTruthy(envSource.GITHUB_ACTIONS)) {
-      mode = 'scrub';
     } else {
-      mode = 'off';
+      mode = 'scrub';
     }
   }
   return {

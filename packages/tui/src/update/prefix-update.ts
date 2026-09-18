@@ -11,6 +11,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import spawn from 'cross-spawn';
+import { sanitizeBashSubprocessEnv } from '@mavis/agent-core/bash-subprocess-env';
 import { resolveMcodeNpmPrefixInstall, type McodeNpmPackageName } from './install-source.js';
 
 const PENDING_UPDATE_FILE = '.mcode-update-pending.json';
@@ -22,6 +23,22 @@ const ACTIVATOR_LEASE_SCHEMA_VERSION = 1;
 const ACTIVATION_STATUS_SCHEMA_VERSION = 1;
 const RESTART_PARENT_WAIT_TIMEOUT_MS = 30_000;
 export const MCODE_UPDATE_PARENT_PID_ENV = 'MCODE_UPDATE_PARENT_PID';
+
+/**
+ * Build the env passed to `cp.spawn` for the restart child.
+ *
+ * @internal Not part of the public API; exported for testability of the
+ * env-scrubbing contract without forcing tests to drive the full activator
+ * IIFE (filesystem state, lease acquisition, process-wait markers).
+ */
+export function buildRestartEnv(): NodeJS.ProcessEnv {
+  const { env } = sanitizeBashSubprocessEnv(process.env, { mode: 'scrub' });
+  delete env[MCODE_UPDATE_PARENT_PID_ENV];
+  delete env['MCODE_UPDATE_ACTIVATOR_LEASE'];
+  delete env['MCODE_UPDATE_PENDING_FILE'];
+  delete env['MCODE_UPDATE_ACTIVATION_STATUS'];
+  return env;
+}
 
 type McodePlatformPath = typeof path.posix | typeof path.win32;
 
@@ -812,8 +829,18 @@ async function activate() {
   const alreadyActivated = await recoverInterrupted();
   const restart = (args) => new Promise((resolve, reject) => {
     if (args.length === 0) return resolve();
+    // The restart child is a fresh mcode process spawned by the activator;
+    // it must not inherit the parent's secrets (provider keys, internal
+    // runtime ids, etc.) or any update-flow scaffolding (activator lease /
+    // pending markers / restart parent pid). Route through the shared
+    // sanitizer (scrub mode) and then drop the update-flow locals.
+    const env = buildRestartEnv();
     const child = cp.spawn(process.execPath, args, {
-      cwd: restartCwd, env: process.env, detached: true, stdio: 'inherit', windowsHide: false,
+      cwd: restartCwd,
+      env,
+      detached: true,
+      stdio: 'inherit',
+      windowsHide: false,
     });
     child.once('error', reject);
     child.once('spawn', () => { child.unref(); resolve(); });

@@ -18,6 +18,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import type { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
+import { sanitizeBashSubprocessEnv } from '@mavis/agent-core/bash-subprocess-env';
+
 type OwnedWorktree = {
   readonly sourceDir: string;
   /** Primary worktree root used as the stable logical Project identity. */
@@ -757,7 +759,13 @@ async function gitWithInput(
   failureMessage: string,
 ): Promise<string> {
   return new Promise<string>((resolvePromise, reject) => {
-    const child = spawn('git', [...args], { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    // Pass a scrubbed env to git so subprocesses launched by the worktree
+    // adapter cannot leak `MAVIS_ACCESS_TOKEN` / `MATRIX_TOKEN` / `*_API_KEY`
+    // into the child (fork-worktree pre-flight runs as a child of the
+    // desktop runtime; default `process.env` would surface the parent's
+    // secrets).
+    const { env } = sanitizeBashSubprocessEnv(process.env, { mode: 'scrub' });
+    const child = spawn('git', [...args], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk: Buffer) => {
@@ -790,7 +798,11 @@ async function streamGit(
   cwd: string,
   consume: (stdout: Readable) => Promise<void>,
 ): Promise<void> {
-  const child = spawn('git', [...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+  // Mirror the scrub env used by `gitWithInput` so the streaming path is
+  // consistent: never let the worktree adapter's git child inherit the
+  // parent desktop's secrets via `process.env`.
+  const { env } = sanitizeBashSubprocessEnv(process.env, { mode: 'scrub' });
+  const child = spawn('git', [...args], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = '';
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', (chunk: string) => {

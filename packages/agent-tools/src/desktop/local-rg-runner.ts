@@ -12,6 +12,7 @@ import { createRequire } from 'node:module';
 import { basename, dirname, isAbsolute, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 
+import { sanitizeBashSubprocessEnv } from '@mavis/agent-core/bash-subprocess-env';
 import type { ToolResult } from '@mavis/agent-core/tools';
 
 const PATH_RG_FALLBACK = 'rg';
@@ -167,8 +168,15 @@ export function runRg(args: string[], cwd: string, opts: RunRgOptions = {}): Pro
       return;
     }
 
+    // rg runs as a child of the desktop runtime; passing `process.env`
+    // would leak `MAVIS_ACCESS_TOKEN` / `MATRIX_TOKEN` / `*_API_KEY` into
+    // any pre/post-process rg executes (filters, .gitignore probes via
+    // git). Route through the shared sanitizer (scrub mode) so the env is
+    // always stripped before reaching rg.
+    const { env } = sanitizeBashSubprocessEnv(process.env, { mode: 'scrub' });
     const child = spawn(binary ?? getRgBinary(), args, {
       cwd,
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
