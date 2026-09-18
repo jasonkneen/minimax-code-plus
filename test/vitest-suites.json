@@ -3,6 +3,7 @@
   "suites": {
     "capability": [
       "packages/local-runtime-v2/test/unit/agent/agent-import.test.ts",
+      "packages/oauth-core/test/credential-store/file-store.test.ts",
       "packages/tui/test/unit/auth-application.test.ts",
       "packages/tui/test/unit/business-telemetry-privacy.test.ts",
       "packages/tui/test/unit/auth-session.test.ts",
