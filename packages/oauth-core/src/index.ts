@@ -7,6 +7,7 @@ export * from './oauth-client.js';
 export * from './endpoint-config.js';
 export * from './auth-core.js';
 export * from './token-provider.js';
+export * from './jwt-verifier.js';
 export * from './factory.js';
 export * from './credential-store/types.js';
 export * from './credential-store/factory.js';

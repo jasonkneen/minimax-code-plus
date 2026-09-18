@@ -35,6 +35,8 @@ export interface AuthState {
     userCode?: string;
     verificationUri?: string;
     verificationUriComplete?: string;
+    /** Random device-flow nonce bound to the lease; absent on legacy flows. */
+    nonce?: string;
   };
 }
 
@@ -108,7 +110,8 @@ function isAuthorizationLease(value: unknown): boolean {
     Number.isFinite(lease.leaseExpiresAtMs) &&
     isOptionalString(lease.userCode) &&
     isOptionalString(lease.verificationUri) &&
-    isOptionalString(lease.verificationUriComplete)
+    isOptionalString(lease.verificationUriComplete) &&
+    isOptionalString(lease.nonce)
   );
 }
 

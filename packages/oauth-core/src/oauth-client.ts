@@ -1,8 +1,10 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
 import { MCODE_OAUTH_AUDIENCE, MCODE_OAUTH_CLIENT_ID, MCODE_OAUTH_SCOPES } from './contracts.js';
+import { JwtVerifier } from './jwt-verifier.js';
 
 const DEVICE_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:device_code';
+const DEVICE_FLOW_STATE_PARAMETER = 'state';
 
 export interface DeviceAuthorization {
   deviceCode: string;
@@ -13,6 +15,13 @@ export interface DeviceAuthorization {
   verificationUriComplete?: string;
   expiresInSec: number;
   intervalSec: number;
+  /**
+   * Random nonce generated at device-authorize time and bound to the local
+   * device-code session. Re-emitted in the token poll request so the issuer
+   * can echo it back; otherwise the client treats it as a server-validated
+   * opaque identifier and refuses any grant whose response diverges from it.
+   */
+  nonce?: string;
 }
 
 export interface OAuthTokenGrant {
@@ -24,6 +33,8 @@ export interface OAuthTokenGrant {
   expiresInSec: number;
   subject?: string;
   accountId?: string;
+  /** Verified device-flow nonce; present whenever the OAuth client produced it. */
+  nonce?: string;
 }
 
 export interface OAuthClient {
@@ -48,6 +59,16 @@ export interface HttpOAuthClientOptions {
   fetchImpl?: typeof fetch;
   sleep?: (durationMs: number) => Promise<void>;
   now?: () => number;
+  /**
+   * Override the JWT verifier (mainly for tests and callers that already
+   * maintain their own JWKS cache). The defaults discover the issuer JWKS
+   * through OIDC metadata using the configured token endpoint.
+   */
+  jwtVerifierOverride?: {
+    jwksUri?: string;
+    now?: () => number;
+    sleep?: (durationMs: number) => Promise<void>;
+  };
 }
 
 export class OAuthProtocolError extends Error {
@@ -68,17 +89,23 @@ export class HttpOAuthClient implements OAuthClient {
   private readonly fetchImpl: typeof fetch;
   private readonly sleep: (durationMs: number) => Promise<void>;
   private readonly now: () => number;
+  private readonly jwtVerifier: JwtVerifier;
 
   constructor(private readonly options: HttpOAuthClientOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleep =
       options.sleep ?? ((durationMs) => new Promise((resolve) => setTimeout(resolve, durationMs)));
     this.now = options.now ?? Date.now;
+    this.jwtVerifier = new JwtVerifier({
+      fetchImpl: this.fetchImpl,
+      ...(options.jwtVerifierOverride ?? {}),
+    });
   }
 
   async startDeviceAuthorization(options: OAuthRequestOptions = {}): Promise<DeviceAuthorization> {
     const codeVerifier = randomBytes(32).toString('base64url');
     const codeChallenge = createHash('sha256').update(codeVerifier, 'ascii').digest('base64url');
+    const nonce = randomUUID();
     const body = await this.postForm(
       this.options.deviceAuthorizationEndpoint,
       {
@@ -87,6 +114,7 @@ export class HttpOAuthClient implements OAuthClient {
         audience: MCODE_OAUTH_AUDIENCE,
         code_challenge: codeChallenge,
         code_challenge_method: 'S256',
+        [DEVICE_FLOW_STATE_PARAMETER]: nonce,
       },
       {
         headers: this.options.deviceAuthorizationHeaders,
@@ -115,6 +143,7 @@ export class HttpOAuthClient implements OAuthClient {
     return {
       deviceCode,
       codeVerifier,
+      nonce,
       ...(usesAccountUserCodePolling ? { tokenPollingParameter: 'user_code' as const } : {}),
       userCode,
       verificationUri,
@@ -141,14 +170,18 @@ export class HttpOAuthClient implements OAuthClient {
         authorization.tokenPollingParameter === 'user_code'
           ? { user_code: authorization.userCode }
           : { device_code: authorization.deviceCode };
+      const formValues: Record<string, string> = {
+        grant_type: DEVICE_GRANT_TYPE,
+        ...pollingCode,
+        client_id: MCODE_OAUTH_CLIENT_ID,
+        code_verifier: authorization.codeVerifier,
+      };
+      if (authorization.nonce) {
+        formValues[DEVICE_FLOW_STATE_PARAMETER] = authorization.nonce;
+      }
       const response = await this.postFormAllowOAuthError(
         this.options.tokenEndpoint,
-        {
-          grant_type: DEVICE_GRANT_TYPE,
-          ...pollingCode,
-          client_id: MCODE_OAUTH_CLIENT_ID,
-          code_verifier: authorization.codeVerifier,
-        },
+        formValues,
         { signal: options.signal },
       );
       const pollingStatus = readString(response.body, 'status');
@@ -167,7 +200,10 @@ export class HttpOAuthClient implements OAuthClient {
       if (response.ok && (pollingStatus === 'expired' || pollingStatus === 'expired_token')) {
         throw new OAuthProtocolError('expired_token');
       }
-      if (response.ok) return parseTokenGrant(response.body);
+      if (response.ok) return parseTokenGrant(response.body, undefined, this.jwtVerifier, {
+        expectedNonce: authorization.nonce,
+        tokenEndpoint: this.options.tokenEndpoint,
+      });
       if (response.error === 'authorization_pending') {
         await sleepWithSignal(this.sleep, intervalMs, options.signal);
         continue;
@@ -194,7 +230,9 @@ export class HttpOAuthClient implements OAuthClient {
       scope: MCODE_OAUTH_SCOPES.join(' '),
       audience: MCODE_OAUTH_AUDIENCE,
     });
-    return parseTokenGrant(body, refreshToken);
+    return parseTokenGrant(body, refreshToken, this.jwtVerifier, {
+      tokenEndpoint: this.options.tokenEndpoint,
+    });
   }
 
   async revokeToken(refreshToken: string): Promise<void> {
@@ -287,15 +325,20 @@ async function sleepWithSignal(
   }
 }
 
-function parseTokenGrant(
+async function parseTokenGrant(
   body: Record<string, unknown>,
-  previousRefreshToken?: string,
-): OAuthTokenGrant {
+  previousRefreshToken: string | undefined,
+  jwtVerifier: JwtVerifier,
+  context: ParseTokenGrantContext,
+): Promise<OAuthTokenGrant> {
   const accessToken = readString(body, 'access_token');
   const refreshToken = readString(body, 'refresh_token') ?? previousRefreshToken;
   const tokenType = readString(body, 'token_type');
   const expiresInSec = readPositiveNumber(body, 'expires_in');
-  const claims = accessToken ? decodeJwtPayload(accessToken) : undefined;
+  const responseState = readString(body, DEVICE_FLOW_STATE_PARAMETER);
+  const claims = accessToken
+    ? await jwtVerifier.verifyAndDecode(accessToken, context.tokenEndpoint)
+    : undefined;
   const scopes = parseScopes(body.scope ?? claims?.scope ?? claims?.scp);
   if (
     !accessToken ||
@@ -306,6 +349,19 @@ function parseTokenGrant(
   ) {
     throw new OAuthProtocolError('invalid_token_response');
   }
+  if (context.expectedNonce !== undefined) {
+    if (responseState !== undefined && responseState !== context.expectedNonce) {
+      throw new OAuthProtocolError(
+        'state_mismatch',
+        'The OAuth token response echoed a different device-flow nonce.',
+      );
+    }
+  } else if (responseState !== undefined) {
+    throw new OAuthProtocolError(
+      'state_mismatch',
+      'The OAuth token response included an unexpected device-flow nonce.',
+    );
+  }
   return {
     accessToken,
     refreshToken,
@@ -313,19 +369,15 @@ function parseTokenGrant(
     scopes,
     audience: MCODE_OAUTH_AUDIENCE,
     expiresInSec,
+    ...(context.expectedNonce !== undefined ? { nonce: context.expectedNonce } : {}),
     ...(readString(claims, 'sub') ? { subject: readString(claims, 'sub') } : {}),
     ...(readString(claims, 'account_id') ? { accountId: readString(claims, 'account_id') } : {}),
   };
 }
 
-function decodeJwtPayload(token: string): Record<string, unknown> | undefined {
-  const segments = token.split('.');
-  if (segments.length !== 3 || !segments[1]) return undefined;
-  try {
-    return asRecord(JSON.parse(Buffer.from(segments[1], 'base64url').toString('utf8')));
-  } catch {
-    return undefined;
-  }
+interface ParseTokenGrantContext {
+  expectedNonce?: string;
+  tokenEndpoint: string;
 }
 
 function parseScopes(value: unknown): string[] {

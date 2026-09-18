@@ -501,6 +501,7 @@ export class MCodeOAuthCore {
       if (state?.status !== 'authorizing' || state.authorization?.leaseId !== leaseId) {
         throw new AuthRequiredError();
       }
+      assertNonceMatchesLease(grant.nonce, state.authorization?.nonce);
       const credential = await this.options.credentialStore.get(
         this.options.namespace.credentialKey,
       );
@@ -594,6 +595,7 @@ export class MCodeOAuthCore {
           ...(authorization.verificationUriComplete
             ? { verificationUriComplete: authorization.verificationUriComplete }
             : {}),
+          ...(authorization.nonce ? { nonce: authorization.nonce } : {}),
         },
       });
     });
@@ -722,6 +724,31 @@ export class MCodeOAuthCore {
 
 function assertLoginNotCancelled(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new AuthLoginCancelledError();
+}
+
+/**
+ * Enforce that the nonce returned by the OAuth client matches the one
+ * persisted on the namespace lease. The legacy case (lease carries no nonce
+ * yet because it was written by an older build) is accepted so existing
+ * in-flight logins survive the upgrade; otherwise mismatched nonces fail.
+ */
+function assertNonceMatchesLease(
+  grantNonce: string | undefined,
+  leaseNonce: string | undefined,
+): void {
+  if (leaseNonce === undefined) return;
+  if (grantNonce === undefined) {
+    throw new OAuthProtocolError(
+      'state_mismatch',
+      'The persisted lease carries a device-flow nonce that the grant did not return.',
+    );
+  }
+  if (grantNonce !== leaseNonce) {
+    throw new OAuthProtocolError(
+      'state_mismatch',
+      'The OAuth device-flow nonce does not match the persisted lease.',
+    );
+  }
 }
 
 function isInvalidRefreshGrant(error: unknown): boolean {
