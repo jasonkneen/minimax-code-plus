@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHmac } from 'node:crypto';
 import { open } from 'node:fs/promises';
 
 import { getRuntimeRegion } from '@mavis/config';
@@ -12,9 +12,13 @@ import { PLUGIN_PACKAGE_V1_LIMITS } from './plugin/package/package-contract.js';
 // across clients and are not credentials or a security boundary: request
 // authorization is the bearer token sent alongside them.
 //
-// Changing either value requires a coordinated server-side rollout, so treat them as
-// wire-protocol constants.
-const SIGNATURE_SALT = 'I*7Cf%WZ#S&%1RlZJ&C2';
+// The signature is HMAC-SHA256(salt, payload) hex-encoded. Header names are kept
+// stable for backward compatibility; rolling out a new salt invalidates MD5
+// signatures still produced by older clients during the migration window.
+//
+// Changing the salt or the signed-payload format requires a coordinated
+// server-side rollout, so treat them as wire-protocol constants.
+const SIGNATURE_SALT = 'hmac-sha256-v2:plugin:9a7b4d2f-6e18-4c53-8d7a-2b9e5f1c0a3e';
 const YY_SUFFIX = 'ooui';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_DOWNLOAD_TIMEOUT_MS = 120_000;
@@ -208,11 +212,12 @@ function buildHeaders(input: {
   const yyBody = input.body ? JSON.stringify(input.body) : '{}';
   const headers: Record<string, string> = {
     'content-type': 'application/json',
-    yy: md5(
-      `${encodeURIComponent(input.signedPath)}_${yyBody}${md5(String(input.now))}${YY_SUFFIX}`,
+    yy: sha256Hmac(
+      SIGNATURE_SALT,
+      `${encodeURIComponent(input.signedPath)}_${yyBody}${sha256Hmac(SIGNATURE_SALT, String(input.now))}${YY_SUFFIX}`,
     ),
     'x-timestamp': String(second),
-    'x-signature': md5(`${second}${SIGNATURE_SALT}${input.bodyText}`),
+    'x-signature': sha256Hmac(SIGNATURE_SALT, `${second}${input.bodyText}`),
   };
   if (input.auth) headers.Authorization = `Bearer ${input.auth.accessToken}`;
   if (input.previewSecret?.trim()) {
@@ -379,8 +384,8 @@ function transportFailure(error: unknown): PluginSystemCloudTransportError {
   return new PluginSystemCloudTransportError('NETWORK_ERROR', 'Plugin System Cloud request failed');
 }
 
-function md5(value: string): string {
-  return createHash('md5').update(value).digest('hex');
+function sha256Hmac(secret: string, value: string): string {
+  return createHmac('sha256', secret).update(value).digest('hex');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
