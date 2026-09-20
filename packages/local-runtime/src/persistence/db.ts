@@ -495,6 +495,21 @@ const MIGRATIONS: Migration[] = [
     version: 33,
     sql: `SELECT 1;`,
   },
+  {
+    // Ledger watermark incremental: track the trailing byte offset of each
+    // session's ledger alongside the seq/event id, so `append()` no longer
+    // has to open and parse the whole JSONL file under a SQLite IMMEDIATE
+    // transaction. The compatibility pass below guarantees the new column is
+    // present even on dbs whose `schema_migrations` bookkeeping predates
+    // v34 (e.g. fresh dbs created on an older binary, then upgraded).
+    //
+    // The column is NULLABLE on purpose: rows written before v34 do not
+    // know the trailing offset, so the read path treats NULL as "rebuild
+    // from the file" rather than "offset = 0". Once the next `append()`
+    // runs, the column is back-filled to the file's true trailing offset.
+    version: 34,
+    sql: `SELECT 1;`,
+  },
 ];
 export function withLocalRuntimeDb<T>(dataDir: DataDirInput, fn: (db: DatabaseLike) => T): T {
   return fn(openLocalRuntimeDb(dataDir));
@@ -576,6 +591,7 @@ function ensureSchema(db: DatabaseLike): void {
   ensureThreadGoalTableCompatibility(db);
   ensureTurnDiffTableCompatibility(db);
   ensureCronTableCompatibility(db);
+  ensureLedgerWatermarkTableCompatibility(db);
 }
 
 function runMigration(db: DatabaseLike, migration: Migration): void {
@@ -737,6 +753,39 @@ function ensureCronTableCompatibility(db: DatabaseLike): void {
       ON local_runtime_crons(cron_id);
   `);
   backfillCronIds(db);
+}
+
+/**
+ * Ledger watermark incremental compatibility: guarantee
+ * `local_runtime_ledger_watermarks` carries the `last_byte_offset` column
+ * introduced by migration v34. Mirrors `ensureThreadGoalTableCompatibility`:
+ * the ALTER runs at open time so dbs whose `schema_migrations` bookkeeping
+ * predates v34 still converge. Idempotent: a guarded `PRAGMA table_info`
+ * skips the ALTER when the column is already present.
+ *
+ * Rows written before v34 keep `last_byte_offset IS NULL`. The append path
+ * treats NULL as "rebuild from the file" — the next `append()` writes the
+ * true trailing offset, so a single append is enough to converge the row.
+ */
+function ensureLedgerWatermarkTableCompatibility(db: DatabaseLike): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS local_runtime_ledger_watermarks (
+      session_id TEXT PRIMARY KEY,
+      last_seq INTEGER NOT NULL,
+      last_event_id TEXT NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+  `);
+  const columns = new Set(
+    db
+      .prepare('PRAGMA table_info(local_runtime_ledger_watermarks)')
+      .all()
+      .map((row) => (row as TableInfoRow).name)
+      .filter((name): name is string => typeof name === 'string'),
+  );
+  if (!columns.has('last_byte_offset')) {
+    db.exec('ALTER TABLE local_runtime_ledger_watermarks ADD COLUMN last_byte_offset INTEGER;');
+  }
 }
 
 /**

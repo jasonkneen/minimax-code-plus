@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { appendFileSync } from 'node:fs';
+import { appendFile as asyncAppendFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 
 import {
@@ -58,6 +58,27 @@ export interface FileSessionLedgerStoreOptions {
   metricsClient?: MetricsClient;
 }
 
+interface LedgerWatermarkRow {
+  last_seq?: unknown;
+  last_event_id?: unknown;
+  updated_at_ms?: unknown;
+  last_byte_offset?: unknown;
+}
+
+/**
+ * Lightweight watermark projection carried in SQLite (table
+ * `local_runtime_ledger_watermarks`). The trailing byte offset lets the hot
+ * append path skip the whole-file scan that used to run inside the SQLite
+ * IMMEDIATE transaction; recovery is the only case that still falls back to
+ * `readLedgerWatermarkSync`.
+ */
+interface LedgerWatermarkRecord {
+  lastSeq: number;
+  lastEventId: string;
+  updatedAtMs: number;
+  lastByteOffset: number | null;
+}
+
 export class FileSessionLedgerStore implements LocalSessionLedgerStore {
   private readonly nowMs: () => number;
   private readonly makeEventId: (sessionId: string, kind: string, seq: number) => string;
@@ -90,7 +111,15 @@ export class FileSessionLedgerStore implements LocalSessionLedgerStore {
       // Duration measured from inside the lock: actual write work, excluding lock wait.
       const startMs = this.nowMs();
       let committedResult: AppendLocalSessionLedgerResult | undefined;
+      let ledgerPath: string | undefined;
+      let preAppendSize: number | undefined;
+      let appendContents: string | undefined;
       try {
+        // The SQLite IMMEDIATE transaction only does the bookkeeping work
+        // (read the cached watermark, allocate seq ids, write the new
+        // watermark row). The actual file append happens AFTER the
+        // transaction commits, so the writer lock is never held during the
+        // sync file scan/write.
         const result = withLocalRuntimeDb(this.dataDir, (db) =>
           runInTransaction(db, () => {
             const artifactPaths = ensureV2SessionArtifactManifestSync(this.dataDir, sessionId, {
@@ -98,17 +127,29 @@ export class FileSessionLedgerStore implements LocalSessionLedgerStore {
               updatedAtMs: this.nowMs(),
               source: inferArtifactSource(drafts),
             });
-            const ledgerPath = artifactPaths.ledger;
             const managedRoot = resolveV2DirectoryContract(this.dataDir).root;
-            ensureV2ArtifactParentDirSync(ledgerPath, artifactPaths.sessionDir, managedRoot);
-            const fileWatermark = readLedgerWatermarkSync(ledgerPath, sessionId);
-            const events = this.allocateEvents(db, sessionId, drafts, fileWatermark);
-            const boundary = needsJsonlLineBoundarySync(ledgerPath) ? '\n' : '';
+            ensureV2ArtifactParentDirSync(artifactPaths.ledger, artifactPaths.sessionDir, managedRoot);
+            // O(1) read: if the cached watermark matches the file's true
+            // trailing offset, skip the file scan entirely. Only call
+            // `readLedgerWatermarkSync` on the recovery path (cold start,
+            // crash between SQLite commit and file append, schema drift).
+            const { fileWatermark, sqliteWatermark } = resolveAppendWatermark(
+              db,
+              artifactPaths.ledger,
+              sessionId,
+            );
+            const events = this.allocateEvents(
+              sessionId,
+              drafts,
+              sqliteWatermark,
+              fileWatermark,
+            );
+            const boundary = needsJsonlLineBoundarySync(artifactPaths.ledger) ? '\n' : '';
             const contents = `${boundary}${events.map((event) => JSON.stringify(event)).join('\n')}\n`;
-            const preAppendSize = ledgerFileSizeSync(ledgerPath);
-            const byteOffset = preAppendSize + Buffer.byteLength(contents, 'utf-8');
+            const size = ledgerFileSizeSync(artifactPaths.ledger);
+            const byteOffset = size + Buffer.byteLength(contents, 'utf-8');
             const last = events[events.length - 1]!;
-            const appendResult = {
+            const appendResult: AppendLocalSessionLedgerResult = {
               events,
               watermark: {
                 sessionId,
@@ -118,28 +159,53 @@ export class FileSessionLedgerStore implements LocalSessionLedgerStore {
                 byteOffset,
               },
             };
-            try {
-              appendFileSync(ledgerPath, contents, { encoding: 'utf-8' });
-            } catch (error) {
-              if (!recoverFailedLedgerAppendSync(ledgerPath, preAppendSize, contents, error)) {
-                throw error;
-              }
-            }
+            // Persist the new watermark INSIDE the transaction so the next
+            // append sees the updated trailing offset without a file scan.
+            upsertLedgerWatermark(db, sessionId, appendResult.watermark, byteOffset);
             committedResult = appendResult;
+            ledgerPath = artifactPaths.ledger;
+            preAppendSize = size;
+            appendContents = contents;
             appendDisplayTranscriptBestEffort(artifactPaths, events, managedRoot);
             return committedResult;
           }),
         );
+        // File append is intentionally outside the SQLite writer lock: a
+        // multi-MiB `fs.appendFile` no longer blocks every other writer
+        // in the process (it runs on libuv's worker pool). The
+        // `withSessionAppendLock` guard keeps two appenders to the same
+        // session serialized; the SQLite watermark row carries the
+        // trailing offset, so the next append picks up where we wrote —
+        // even after a crash that interrupts the file append (recovery
+        // converges the row via `readLedgerWatermarkSync`).
+        if (ledgerPath !== undefined && appendContents !== undefined) {
+          try {
+            await asyncAppendFile(ledgerPath, appendContents, { encoding: 'utf-8' });
+          } catch (error) {
+            if (
+              preAppendSize === undefined ||
+              !recoverFailedLedgerAppendSync(ledgerPath, preAppendSize, appendContents, error)
+            ) {
+              throw error;
+            }
+          }
+        }
         this.recordAppendMetrics(sessionId, 'ok', startMs);
         return result;
       } catch (err) {
+        // `committedResult` is set only when the SQLite transaction
+        // commits — i.e. the SQLite state already records the new
+        // watermark. Recovery will resync on next open. Returning the
+        // committed result preserves the original contract: a committed
+        // append is never rolled back just because the post-commit file
+        // append threw after recovery failed.
         if (committedResult) {
           logger.warn(
             {
               session_id: sessionId,
               error_type: err instanceof Error ? err.name : typeof err,
             },
-            '[file-session-ledger] allocator transaction completion failed after JSONL commit',
+            '[file-session-ledger] allocator transaction committed but file append failed; recovery will resync on next open',
           );
           this.recordAppendMetrics(sessionId, 'ok', startMs);
           return committedResult;
@@ -216,16 +282,22 @@ export class FileSessionLedgerStore implements LocalSessionLedgerStore {
   }
 
   private allocateEvents(
-    db: DatabaseLike,
     sessionId: string,
     drafts: readonly LocalSessionLedgerEventDraft[],
+    sqliteWatermark: LedgerWatermarkRecord | null,
     fileWatermark?: LocalSessionLedgerWatermark,
   ): LocalSessionLedgerEvent[] {
-    const row = db
-      .prepare('SELECT last_seq FROM local_runtime_ledger_watermarks WHERE session_id = ?')
-      .get(sessionId) as { last_seq?: unknown } | undefined;
-    const lastSeq = row?.last_seq;
-    const sqliteSeq = Number.isInteger(lastSeq) ? Number(lastSeq) : 0;
+    // Hot path: the SQLite row is authoritative when its trailing offset
+    // matches the file's true size. The reconciliation step in
+    // `resolveAppendWatermark` keeps the two in lockstep, so a normal
+    // append sees `sqliteWatermark` and `fileWatermark` agree on `lastSeq`.
+    // We still take `max(sqlite, file)` defensively in case the trailing
+    // offset is stale (older binary wrote the row before the column
+    // existed, manual truncation, etc.).
+    const sqliteSeq =
+      sqliteWatermark && Number.isInteger(sqliteWatermark.lastSeq)
+        ? sqliteWatermark.lastSeq
+        : 0;
     let nextSeq = Math.max(sqliteSeq, fileWatermark?.lastSeq ?? 0) + 1;
     const events = drafts.map((draft) => {
       const seq = nextSeq++;
@@ -237,21 +309,6 @@ export class FileSessionLedgerStore implements LocalSessionLedgerStore {
         createdAtMs: this.nowMs(),
       } as LocalSessionLedgerEvent;
     });
-    const last = events[events.length - 1]!;
-    db.prepare(
-      `
-      INSERT INTO local_runtime_ledger_watermarks (
-        session_id,
-        last_seq,
-        last_event_id,
-        updated_at_ms
-      ) VALUES (?, ?, ?, ?)
-      ON CONFLICT(session_id) DO UPDATE SET
-        last_seq = excluded.last_seq,
-        last_event_id = excluded.last_event_id,
-        updated_at_ms = excluded.updated_at_ms
-    `,
-    ).run(sessionId, last.seq, last.eventId, last.createdAtMs);
     return events;
   }
 
@@ -365,4 +422,125 @@ function defaultEventId(sessionId: string, kind: string, seq: number): string {
 
 function randomSuffix(): string {
   return randomUUID().replace(/-/g, '');
+}
+
+/**
+ * Read the cached watermark row from SQLite (O(1), single-row lookup) and
+ * decide whether the file scan is still needed. Returns both pieces so the
+ * caller can pass them into `allocateEvents`:
+ *  - `sqliteWatermark` is the row as read, or `null` if no row exists.
+ *  - `fileWatermark` is only set on the recovery path (mismatch / first
+ *    append for a session whose file already has events).
+ *
+ * When the file scan runs, the SQLite row is back-filled in the same
+ * transaction so subsequent appends skip the scan. The write is idempotent.
+ */
+function resolveAppendWatermark(
+  db: DatabaseLike,
+  ledgerPath: string,
+  sessionId: string,
+): { fileWatermark?: LocalSessionLedgerWatermark; sqliteWatermark: LedgerWatermarkRecord | null } {
+  const sqliteRow = readLedgerWatermarkRow(db, sessionId);
+  if (sqliteRow === null) {
+    // No row yet. If the file is non-empty we still want to find the
+    // trailing offset (e.g. session was migrated from an older binary,
+    // or the row was lost to disk corruption). Once we sync the row the
+    // next append takes the O(1) path.
+    const fileWatermark = ledgerFileSizeSync(ledgerPath) === 0
+      ? undefined
+      : readLedgerWatermarkSync(ledgerPath, sessionId);
+    if (fileWatermark) {
+      upsertLedgerWatermark(db, sessionId, fileWatermark, fileWatermark.byteOffset ?? null);
+    }
+    return { fileWatermark, sqliteWatermark: null };
+  }
+  const fileSize = ledgerFileSizeSync(ledgerPath);
+  if (
+    sqliteRow.lastByteOffset !== null &&
+    sqliteRow.lastByteOffset === fileSize
+  ) {
+    // Hot path: the cached trailing offset matches the file's true size.
+    // Trust the SQLite row, no scan required.
+    return { sqliteWatermark: sqliteRow };
+  }
+  // Recovery: cached offset is missing or disagrees with the file. Either
+  // (a) the row was written before v34 (last_byte_offset IS NULL), (b) the
+  // process crashed between the SQLite commit and the file append leaving
+  // SQLite ahead of the file, or (c) the file was truncated/rewound out of
+  // band. In every case, rebuild the row from the file so subsequent
+  // appends converge.
+  const fileWatermark =
+    fileSize === 0
+      ? undefined
+      : readLedgerWatermarkSync(ledgerPath, sessionId);
+  if (fileWatermark) {
+    upsertLedgerWatermark(db, sessionId, fileWatermark, fileWatermark.byteOffset ?? null);
+    return { fileWatermark, sqliteWatermark: readLedgerWatermarkRow(db, sessionId) };
+  }
+  // File is empty (or vanished): SQLite row was for events that no longer
+  // exist on disk. Reset the row to a zero-state so subsequent appends
+  // start from seq=1. Keep the lastByteOffset aligned with the empty file.
+  upsertLedgerWatermark(
+    db,
+    sessionId,
+    {
+      lastSeq: 0,
+      lastEventId: '',
+      updatedAtMs: sqliteRow.updatedAtMs,
+    },
+    fileSize,
+  );
+  return { sqliteWatermark: null };
+}
+
+function readLedgerWatermarkRow(
+  db: DatabaseLike,
+  sessionId: string,
+): LedgerWatermarkRecord | null {
+  const row = db
+    .prepare(
+      `SELECT last_seq, last_event_id, updated_at_ms, last_byte_offset
+       FROM local_runtime_ledger_watermarks
+       WHERE session_id = ?`,
+    )
+    .get(sessionId) as LedgerWatermarkRow | undefined;
+  if (!row) return null;
+  const lastSeq = Number(row.last_seq);
+  const lastByteOffsetRaw = row.last_byte_offset;
+  return {
+    lastSeq: Number.isInteger(lastSeq) ? lastSeq : 0,
+    lastEventId: typeof row.last_event_id === 'string' ? row.last_event_id : '',
+    updatedAtMs:
+      typeof row.updated_at_ms === 'number' && Number.isFinite(row.updated_at_ms)
+        ? row.updated_at_ms
+        : 0,
+    lastByteOffset:
+      typeof lastByteOffsetRaw === 'number' && Number.isFinite(lastByteOffsetRaw)
+        ? lastByteOffsetRaw
+        : null,
+  };
+}
+
+function upsertLedgerWatermark(
+  db: DatabaseLike,
+  sessionId: string,
+  watermark: { lastSeq: number; lastEventId: string; updatedAtMs: number },
+  lastByteOffset: number | null,
+): void {
+  db.prepare(
+    `
+    INSERT INTO local_runtime_ledger_watermarks (
+      session_id,
+      last_seq,
+      last_event_id,
+      updated_at_ms,
+      last_byte_offset
+    ) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(session_id) DO UPDATE SET
+      last_seq = excluded.last_seq,
+      last_event_id = excluded.last_event_id,
+      updated_at_ms = excluded.updated_at_ms,
+      last_byte_offset = excluded.last_byte_offset
+  `,
+  ).run(sessionId, watermark.lastSeq, watermark.lastEventId, watermark.updatedAtMs, lastByteOffset);
 }
