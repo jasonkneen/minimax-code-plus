@@ -20,7 +20,7 @@
  * Ground-truth-aware estimate
  * ---------------------------
  * `estimateContextTokens` preserves pi-agent-core's good pattern:
- *  1. Find the last successful assistant message with a usage block;
+ *  1. Find the last successful assistant message with usage for the current context;
  *  2. Trust its provider-reported total as the prefix sum;
  *  3. Estimate only the trailing messages after that point.
  * This bounds estimator error to the trailing window — typically a handful of
@@ -47,7 +47,9 @@
 
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import { countTokens as countO200kBase } from 'gpt-tokenizer/model/gpt-4o';
+import type { ContextCompactionSummaryMessage } from './types.js';
 
 export interface ContextTokenEstimate {
   /** Estimated total tokens consumed by `messages`. */
@@ -163,15 +165,49 @@ function getAssistantUsage(message: AgentMessage): AssistantUsageRef | undefined
 function getLastAssistantUsageInfo(
   messages: AgentMessage[],
 ): { usage: AssistantUsageRef; index: number } | undefined {
+  let firstFreshIndex = 0;
+  let compactedAt: number | undefined;
   for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const usage = getAssistantUsage(messages[i]!);
+    if (messages[i]!.role !== 'compactionSummary') continue;
+    const summary = messages[i] as ContextCompactionSummaryMessage;
+    const keptCount = summary.keptMessageCount;
+    if (keptCount !== undefined) {
+      // Kept assistants appear AFTER the summary too. Only appended responses
+      // describe the replacement context; their wall-clock timestamps may tie
+      // or precede the summary if the clock changed.
+      if (!Number.isSafeInteger(keptCount) || keptCount < 0) return undefined;
+      firstFreshIndex = i + 1 + keptCount;
+    } else {
+      // Legacy persisted transcripts have no explicit retained-tail boundary.
+      // Match the local runtime's conservative timestamp freshness rule.
+      if (!Number.isFinite(summary.timestamp)) return undefined;
+      compactedAt = summary.timestamp;
+      firstFreshIndex = i + 1;
+    }
+    break;
+  }
+  for (let i = messages.length - 1; i >= firstFreshIndex; i -= 1) {
+    const message = messages[i]!;
+    if (
+      compactedAt !== undefined &&
+      (!Number.isFinite(message.timestamp) || message.timestamp <= compactedAt)
+    ) {
+      continue;
+    }
+    const usage = getAssistantUsage(message);
     if (usage) return { usage, index: i };
   }
   return undefined;
 }
 
+const MAX_INLINE_CACHE_KEY_UNITS = 256;
+const MAX_CACHED_TEXT_ENTRIES = 2_048;
+
 export class BpeTokenEstimator implements TokenEstimator {
   private readonly countExactTokens: (text: string) => number;
+  // Bounded content keys survive detached histories without retaining long
+  // message bodies. Hash UTF-16 units so lone surrogates stay distinct.
+  private readonly textTokens = new Map<string, number>();
 
   /**
    * @param encoder Override the default o200k_base tokenizer. Tests inject
@@ -193,12 +229,28 @@ export class BpeTokenEstimator implements TokenEstimator {
 
   estimateTextTokens(text: string): number {
     if (!text) return 0;
+    const key =
+      text.length <= MAX_INLINE_CACHE_KEY_UNITS
+        ? `text:${text}`
+        : `sha256:${createHash('sha256').update(text, 'utf16le').digest('hex')}`;
+    const cached = this.textTokens.get(key);
+    if (cached !== undefined) {
+      this.textTokens.delete(key);
+      this.textTokens.set(key, cached);
+      return cached;
+    }
     try {
       if (text.length > MAX_EXACT_TOKENIZER_CHARS && hasOversizedAlphanumericRun(text)) {
         return estimateTextTokensUpperBound(text);
       }
       const tokens = this.countExactTokens(text);
-      return Number.isFinite(tokens) && tokens >= 0 ? tokens : estimateTextTokensUpperBound(text);
+      if (!Number.isFinite(tokens) || tokens < 0) return estimateTextTokensUpperBound(text);
+      if (this.textTokens.size >= MAX_CACHED_TEXT_ENTRIES) {
+        const oldest = this.textTokens.keys().next().value;
+        if (oldest !== undefined) this.textTokens.delete(oldest);
+      }
+      this.textTokens.set(key, tokens);
+      return tokens;
     } catch {
       return estimateTextTokensUpperBound(text);
     }
@@ -261,7 +313,10 @@ export class BpeTokenEstimator implements TokenEstimator {
         return tokens;
       }
       case 'bashExecution': {
-        const m = message as AgentMessage & { command?: string; output?: string };
+        const m = message as AgentMessage & {
+          command?: string;
+          output?: string;
+        };
         tokens += this.estimateTextTokens(m.command ?? '');
         tokens += this.estimateTextTokens(m.output ?? '');
         return tokens;

@@ -14,14 +14,19 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { withoutProxyEnvironment } from "./offline-environment.mjs";
 
-const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+const cli = process.env.MCODE_TEST_CLI ?? fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 // This fixture validates BYOK transport and real Runtime persistence, not model quality.
 test(
   "BYOK runs without managed login and resumes its saved conversation",
   { timeout: 90000 },
   async (t) => {
-    const dataDir = mkdtempSync(path.join(tmpdir(), "minimax-code-byok-"));
+    const fixtureDir = mkdtempSync(path.join(tmpdir(), "minimax-code-byok-"));
+    const dataDir = path.join(fixtureDir, "data");
+    const workspaceDir = path.join(fixtureDir, "workspace");
+    mkdirSync(workspaceDir);
     const dbPath = path.join(dataDir, "v2", "sqlite", "runtime-state.sqlite");
     mkdirSync(path.dirname(dbPath), { recursive: true });
     const legacyDb = new Database(dbPath);
@@ -36,8 +41,9 @@ test(
     }
     const requests = [];
     const readMarker = `ACTUAL_FILE_CONTENT_${Date.now()}`;
-    writeFileSync(path.join(dataDir, "read-fixture.txt"), readMarker);
+    writeFileSync(path.join(workspaceDir, "read-fixture.txt"), readMarker);
     let toolRequested = false;
+    let rejectConnection = false;
     const networkAudit = path.join(dataDir, "network-audit.log");
     const server = createServer(async (req, res) => {
       let raw = "";
@@ -46,6 +52,12 @@ test(
       requests.push({ url: req.url, auth: req.headers.authorization, body });
       if (!req.url?.endsWith("/chat/completions")) {
         res.writeHead(404).end();
+        return;
+      }
+      if (rejectConnection) {
+        res.writeHead(401, { "content-type": "application/json" }).end(
+          JSON.stringify({ error: { message: "Synthetic invalid credential" } }),
+        );
         return;
       }
       if (!body.stream) {
@@ -88,7 +100,7 @@ test(
                       function: {
                         name: "read",
                         arguments: JSON.stringify({
-                          path: path.join(dataDir, "read-fixture.txt"),
+                          path: path.join(workspaceDir, "read-fixture.txt"),
                         }),
                       },
                     },
@@ -139,12 +151,11 @@ test(
             : "Unexpected external request",
         );
       } finally {
-        rmSync(dataDir, { recursive: true, force: true });
+        rmSync(fixtureDir, { recursive: true, force: true });
       }
     });
     const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
     const env = {
-      ...process.env,
       MINIMAX_DATA_DIR: dataDir,
       MAVIS_DATA_DIR: dataDir,
       MCODE_PROVIDER_API_KEY: "fixture-only-key",
@@ -153,12 +164,9 @@ test(
       MCODE_TEST_MANAGED_OFFLINE: "1",
       MCODE_TEST_PROCESS_PROBE: "1",
       NODE_OPTIONS: `--import=${new URL("./network-deny.mjs", import.meta.url).href}`,
-      HTTP_PROXY: "",
-      HTTPS_PROXY: "",
-      ALL_PROXY: "",
     };
     let commandSequence = 0;
-    async function run(args) {
+    async function run(args, environment = process.env) {
       const startedAt = Date.now();
       const label = args.slice(0, 2).join(" ");
       const requestCountAtStart = requests.length;
@@ -168,8 +176,8 @@ test(
         : args;
       return new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [cli, ...commandArgs], {
-          cwd: dataDir,
-          env,
+          cwd: workspaceDir,
+          env: { ...withoutProxyEnvironment(environment), ...env },
           stdio: ["ignore", "pipe", "pipe"],
         });
         let stdout = "",
@@ -229,6 +237,7 @@ test(
       "--model",
       "fixture-model",
     ]);
+    assert.equal(requests.length, 0, "Adding without --use must not test or activate");
     const snapshot = JSON.parse(await run(["provider", "list", "--json"]));
     assert.equal(
       snapshot.providers.some((p) => p.kind === "minimax-oauth"),
@@ -238,18 +247,173 @@ test(
       (p) => p.kind === "custom" && p.name === "Fixture",
     );
     assert.ok(selected?.hasApiKey);
-    await run([
-      "provider",
-      "test",
-      selected.providerId,
-      "--model",
-      "fixture-model",
-    ]);
+    const proxyNames = [
+      "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+      "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    ];
+    const cleanEnvironment = Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => !proxyNames.includes(name)),
+    );
+    const proxyValue = (name) => name.toLowerCase() === "no_proxy"
+      ? "*"
+      : "http://127.0.0.1:9";
+    for (const [label, proxies] of [
+      ["no proxy", {}],
+      ...proxyNames.map((name) => [name, { [name]: proxyValue(name) }]),
+      ["uppercase and lowercase together", Object.fromEntries(
+        proxyNames.map((name) => [name, proxyValue(name)]),
+      )],
+    ]) {
+      // Node 24.0–24.2 returns undefined from t.test(), so awaiting it does
+      // not wait for the proxy checks. Keep this shared-fixture phase directly
+      // sequential before changing rejectConnection or checking request counts.
+      // https://github.com/nodejs/node/issues/58227
+      t.diagnostic(`offline BYOK ignores ambient proxies: ${label}`);
+      const environment = Object.freeze({ ...cleanEnvironment, ...proxies });
+      // NO_PROXY alone does not enable proxy mode, so check its isolation explicitly.
+      const isolated = withoutProxyEnvironment(environment);
+      for (const name of proxyNames) assert.equal(isolated[name], "");
+      assert.equal(isolated.PATH, environment.PATH);
+      const beforeRequests = requests.length;
+      const managedAudit = `${networkAudit}.managed`;
+      const beforeManaged = readFileSync(managedAudit, "utf8").length;
+      await run([
+        "provider", "test", selected.providerId, "--model", "fixture-model",
+      ], environment);
+      assert.ok(requests.length > beforeRequests, "The local provider must receive the request");
+      assert.equal(requests[beforeRequests].body.model, "fixture-model");
+      assert.match(
+        readFileSync(managedAudit, "utf8").slice(beforeManaged),
+        /https:\/\/models\.dev\/api\.json|\/mavis\/api\/v1\/models-dev\/catalog/,
+      );
+      assert.equal(existsSync(networkAudit), false, "No outbound network attempt is allowed");
+      for (const [name, value] of Object.entries(proxies)) assert.equal(environment[name], value);
+    }
+    const configPath = path.join(dataDir, "config.yaml");
+    const savedConfig = () => parseYaml(readFileSync(configPath, "utf8"));
+    assert.equal(savedConfig().defaultModel, "minimax/MiniMax-M3");
+    assert.equal(savedConfig().custom_provider.fixture.models["fixture-model"].limit, undefined);
+    assert.equal(selected.active, false);
+    assert.equal(selected.models[0].contextLimit, undefined);
+    assert.equal(selected.models[0].maxOutputTokens, undefined);
+
+    const addArgs = [
+      "provider", "add", "--name", "Limited", "--base-url", baseUrl,
+      "--api-format", "openai-completions", "--model", "fixture-model",
+      "--model", "second-model", "--context-limit", "32768", "--output-limit", "4096", "--use",
+      "--support-image",
+    ];
+    const beforeFailure = readFileSync(configPath, "utf8");
+    rejectConnection = true;
+    await assert.rejects(run(addArgs), /Provider connection test failed.*Nothing was saved/s);
+    assert.equal(readFileSync(configPath, "utf8"), beforeFailure);
+    rejectConnection = false;
+    const beforeAdd = requests.length;
+    assert.match(await run(addArgs), /Provider added and selected: Limited/);
+    assert.ok(requests.length > beforeAdd, "Activation must test the candidate before saving");
+    assert.equal(requests[beforeAdd].body.model, "fixture-model");
+    const config = savedConfig();
+    assert.equal(config.defaultModel, "custom_provider:limited/fixture-model");
+    for (const model of ["fixture-model", "second-model"]) {
+      assert.deepEqual(config.custom_provider.limited.models[model].limit, { context: 32768, output: 4096 });
+      assert.deepEqual(config.custom_provider.limited.models[model].capabilities, { support_image: true });
+    }
+    const configured = JSON.parse(await run(["provider", "list", "--json"])).providers.find(
+      (provider) => provider.name === "Limited",
+    );
+    assert.equal(configured.active, true);
+    assert.equal(configured.models[0].selected, true);
+    for (const model of configured.models) {
+      assert.equal(model.contextLimit, 32768);
+      assert.equal(model.maxOutputTokens, 4096);
+    }
+    const beforeSaveOnly = requests.length;
+    for (const [name, flag, limit] of [
+      ["context-only", "--context-limit", { context: 32768 }],
+      ["output-only", "--output-limit", { output: 32768 }],
+    ]) {
+      await run([
+        "provider", "add", "--name", name, "--base-url", baseUrl,
+        "--api-format", "openai-completions", "--model", "fixture-model", flag, "32768",
+        "--support-image",
+      ]);
+      assert.deepEqual(savedConfig().custom_provider[name].models["fixture-model"].limit, limit);
+      assert.deepEqual(savedConfig().custom_provider[name].models["fixture-model"].capabilities, { support_image: true });
+      assert.equal(savedConfig().defaultModel, config.defaultModel);
+    }
+    assert.equal(requests.length, beforeSaveOnly, "Limits alone must not test or select a model");
+    // Exercise the metadata persisted by provider preset import through real
+    // config reload, headless validation and the OpenAI-compatible request body.
+    const effortConfig = savedConfig();
+    effortConfig.custom_provider.fixture.models["kimi-k3"] = {
+      reasoning: true,
+      thinking: { effortOptions: ["low", "high", "max"] },
+    };
+    effortConfig.custom_provider.fixture.models["vision-modalities"] = {
+      modalities: { input: ["text", "image"], output: ["text"] },
+    };
+    effortConfig.custom_provider.fixture.models["attachment-only"] = { attachment: true };
+    writeFileSync(configPath, stringifyYaml(effortConfig));
+    // The packaged command must carry the declaration through saving, a fresh
+    // process/config reload, attachment preparation and SDK serialization.
+    const imageBase64 = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGUlEQVR4nGP4n8LwnxLMMGrAqAGjBgwXAwCOqWIfmQV0zAAAAABJRU5ErkJggg==";
+    const imagePath = path.join(workspaceDir, "fixture.png");
+    writeFileSync(imagePath, Buffer.from(imageBase64, "base64"));
+    for (const [model, supportsImage] of [
+      ["custom_provider:limited/fixture-model", true],
+      ["custom_provider:context-only/fixture-model", true],
+      ["custom_provider:fixture/vision-modalities", true],
+      ["custom_provider:fixture/fixture-model", false],
+      ["custom_provider:fixture/attachment-only", false],
+    ]) {
+      const beforeImage = requests.length;
+      await run(["exec", "IMAGE_INPUT_TEST", "--model", model, "--file", imagePath,
+        "--timeout", "20s", "--max-steps", "1"]);
+      const turns = requests.slice(beforeImage).filter((r) => r.body.stream === true);
+      assert.ok(turns.length > 0, `Expected a runtime request for ${model}`);
+      for (const { body } of turns) {
+        const images = body.messages.flatMap((message) =>
+          Array.isArray(message.content)
+            ? message.content.filter((part) => part.type === "image_url")
+            : []);
+        if (supportsImage) {
+          assert.equal(images.length, 1, `Expected an inline image for ${model}`);
+          // PNG inputs are transcoded to JPEG by the real attachment pipeline.
+          const url = images[0].image_url.url;
+          assert.match(url, /^data:image\/jpeg;base64,/);
+          const bytes = Buffer.from(url.split(",")[1], "base64");
+          assert.deepEqual([...bytes.subarray(0, 3)], [0xff, 0xd8, 0xff]);
+          assert.deepEqual([...bytes.subarray(-2)], [0xff, 0xd9]);
+          assert.doesNotMatch(JSON.stringify(body.messages), /current model cannot read this image inline/);
+        } else {
+          assert.deepEqual(images, [], `${model} must remain text-only`);
+          assert.match(JSON.stringify(body.messages), /current model cannot read this image inline/);
+        }
+      }
+    }
+    const effortModel = `${selected.providerId}/kimi-k3`;
+    for (const effort of ["low", "high", "max"]) {
+      const beforeEffort = requests.length;
+      await run(["exec", "EFFORT_TEST", "--model", effortModel, "--effort", effort,
+        "--timeout", "20s", "--max-steps", "1"]);
+      // Background title generation is a separate non-streaming request and
+      // does not use the turn's effort selection.
+      const modelRequests = requests.slice(beforeEffort).filter(
+        (r) => r.body.model === "kimi-k3" && r.body.stream === true,
+      );
+      assert.ok(modelRequests.length > 0);
+      for (const request of modelRequests) assert.equal(request.body.reasoning_effort, effort);
+    }
+    const beforeInvalidEffort = requests.length;
+    await assert.rejects(run(["exec", "EFFORT_TEST", "--model", effortModel,
+      "--effort", "medium", "--timeout", "20s", "--max-steps", "1"]),
+    /Available levels: low, high, max/);
+    assert.equal(requests.length, beforeInvalidEffort, "Invalid effort must fail before transport");
     const modelArgs = ["--model", `${selected.providerId}/fixture-model`];
+    // The first run must work through the saved default, without --model or managed login.
     const first = await run([
       "exec",
       "Remember this marker: SOURCE_REPOSITORY_TEST",
-      ...modelArgs,
       "--timeout",
       "20s",
       "--max-steps",
