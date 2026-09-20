@@ -2,12 +2,17 @@
   "comment": "Vitest suites for the standalone distribution, grouped by the gate that runs them. `vitest.oss.config.mjs` includes every group; `scripts/run-vitest-suite.mjs <group>` runs one. Add a test file here rather than in package.json or the Vitest config.",
   "suites": {
     "capability": [
+      "packages/agent-core/test/unit/bash-subprocess-env.test.ts",
+      "packages/agent-modules/permission/test/unit/permission/bash-policy-regressions.test.ts",
+      "packages/agent-tools/src/shared/replace-all-edit.test.ts",
       "packages/local-runtime/test/unit/file-session-ledger-store.test.ts",
       "packages/local-runtime-v2/test/unit/agent/agent-import.test.ts",
       "packages/tui/test/unit/auth-application.test.ts",
+      "packages/tui/test/unit/tui-assistant-content.test.ts",
       "packages/tui/test/unit/business-telemetry-privacy.test.ts",
       "packages/tui/test/unit/auth-session.test.ts",
       "packages/tui/test/unit/cli-auth-command.test.ts",
+      "packages/tui/test/unit/network-proxy.test.ts",
       "packages/tui/test/unit/application-login-gate.test.ts",
       "packages/tui/test/unit/mcode-tools-integration.test.ts",
       "packages/tui/test/unit/provider-application.test.ts",
@@ -61,6 +66,7 @@
       "packages/local-runtime/test/unit/local-background-task-task-output-polling-reminder.test.ts",
       "packages/mcode-tools-host/test/unit/resource-manifest.test.ts",
       "packages/tui/test/unit/headless-config.test.ts",
+      "packages/tui/test/unit/runtime-data-dir.test.ts",
       "packages/tui/test/unit/headless-contract.test.ts",
       "packages/tui/test/unit/headless-invocation.test.ts",
       "packages/tui/test/unit/headless-model-selection.test.ts",
@@ -73,6 +79,7 @@
       "packages/tui/test/unit/tui-chat-controller.test.ts",
       "packages/tui/test/unit/tui-duration.test.ts",
       "packages/tui/test/unit/tui-engine-local-deltas.test.ts",
+      "packages/tui/test/unit/tui-scrollbar-interaction.test.ts",
       "packages/tui/test/unit/tui-image-preview.test.ts",
       "packages/tui/test/unit/tui-session-manager.test.ts",
       "packages/tui/test/unit/tui-shell-block.test.ts",
@@ -134,7 +141,16 @@
       "packages/tui/test/unit/tui/controller/product/command-flow.test.ts",
       "packages/tui/test/unit/tui/controller/product/feature-flow.test.ts",
       "packages/tui/test/unit/tui/features/settings/hotkeys-picker.test.ts",
-      "packages/tui/test/unit/incident-reporter-privacy.test.ts"
+      "packages/tui/test/unit/incident-reporter-privacy.test.ts",
+      "packages/config/test/config-file-permissions.test.ts",
+      "packages/config/test/config-update-preservation.test.ts",
+      "packages/agent-modules/context-manager/test/compaction-usage.test.ts",
+      "packages/local-runtime/test/unit/session-diff-fallback.test.ts",
+      "test/history-processing.test.ts",
+      "packages/tui/test/unit/tui-feature-viewport-contract.test.ts",
+      "packages/tui/test/unit/tui-session-history-flow.test.ts",
+      "packages/tui/test/unit/tui-session-mutation-panels.test.ts",
+      "packages/tui/test/unit/tui-surface-host.test.ts"
     ],
     "status-contract": [
       "packages/tui/test/unit/tui-build-mode-contract.test.ts"

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import yaml from 'js-yaml';
+import { writePrivateConfigFileSync } from './private-config-file.js';
 import { getConfig, getConfigPath, resetConfig } from './config.js';
 import {
   type CuBackend,
@@ -51,7 +52,7 @@ export function setCuBackend(value: CuBackend): void {
 
   raw.cuBackend = value;
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  fs.writeFileSync(configPath, yaml.dump(raw), 'utf-8');
+  writePrivateConfigFileSync(configPath, yaml.dump(raw));
   resetConfig();
 }
 

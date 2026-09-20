@@ -11,8 +11,8 @@
  *   parent session against the runtime API, or a nested `mavis` CLI inside
  *   bash would silently bind to the parent runtime's profile.
  *
- * Layer B — third-party secret scrub. GATED, mirroring the reference CLI's
- *   `subprocessEnv()` design (src/utils/subprocessEnv.ts):
+ * Layer B — provider and integration secret scrub. GATED, mirroring the
+ *   reference CLI's `subprocessEnv()` design (src/utils/subprocessEnv.ts):
  *     - `off`    (interactive default): do not strip user secrets. CC parity —
  *                interactive users rely on env credentials (gh, npm, ...).
  *     - `scrub`  (auto in CI / non-interactive): precise blocklist of
@@ -74,6 +74,7 @@ export interface BashEnvSanitizeResult {
  */
 export const BASH_SUBPROCESS_SCRUB: readonly string[] = [
   // Provider / LLM auth — the runtime re-reads these per-request itself
+  'MCODE_PROVIDER_API_KEY',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN',
@@ -197,7 +198,7 @@ export function sanitizeBashSubprocessEnv(
   // Layer A — MCode boundary strip. Always on; allowlist deliberately ignored.
   removed.push(...stripRuntimeBoundaryKeysFrom(out, 'agent-runtime'));
 
-  // Layer B — third-party secret scrub, gated by mode.
+  // Layer B — provider and integration secret scrub, gated by mode.
   if (policy.mode === 'scrub') {
     for (const key of BASH_SUBPROCESS_SCRUB) {
       for (const name of [key, `INPUT_${key}`]) {

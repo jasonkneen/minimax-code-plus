@@ -4,10 +4,11 @@
 // (they are part of the Config surface); the back edge here is type-only, so
 // there is no runtime import cycle.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import yaml from 'js-yaml';
+import { restrictConfigFileSync, writePrivateConfigFileSync } from './private-config-file.js';
 
 import type {
   CustomProvidersConfig,
@@ -243,10 +244,9 @@ export function migrateLegacyByokProvidersOnDisk(
   writeLegacyMigrationMarker(raw, marker);
   try {
     const backupPath = backupConfigForMigration(configPath);
-    fs.writeFileSync(
+    writePrivateConfigFileSync(
       configPath,
       yaml.dump(raw, { indent: 2, lineWidth: -1, noRefs: true }),
-      'utf-8',
     );
     return { migrated: true, migratedProviders, backupPath };
   } catch (err) {
@@ -474,12 +474,43 @@ function rewriteNexusModelProvider(
   return true;
 }
 
+/** Repair old backups without making archival maintenance a config-load dependency. */
+export function restrictLegacyByokBackups(configPath: string): void {
+  if (process.platform === 'win32') return;
+  const directory = path.dirname(configPath);
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(directory, { withFileTypes: true });
+  } catch {
+    console.warn(
+      `[config] Could not inspect legacy BYOK backups in ${JSON.stringify(directory)}. ` +
+      'Backup permissions were not verified; check directory access and restrict backup permissions manually.',
+    );
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isFile() && entry.name.startsWith(LEGACY_BYOK_BACKUP_PREFIX)) {
+      const backupPath = path.join(directory, entry.name);
+      try {
+        restrictConfigFileSync(backupPath);
+      } catch {
+        // Do not expose arbitrary error messages that could contain config content.
+        console.warn(
+          `[config] Could not restrict legacy BYOK backup ${JSON.stringify(backupPath)}. ` +
+          'It may still be readable by other users; restrict its permissions manually.',
+        );
+      }
+    }
+  }
+}
+
 function backupConfigForMigration(configPath: string): string {
   const backupPath = path.join(
     path.dirname(configPath),
-    `${LEGACY_BYOK_BACKUP_PREFIX}${Date.now()}`,
+    `${LEGACY_BYOK_BACKUP_PREFIX}${Date.now()}.${randomUUID()}`,
   );
-  fs.copyFileSync(configPath, backupPath);
+  restrictConfigFileSync(configPath);
+  writePrivateConfigFileSync(backupPath, fs.readFileSync(configPath), true);
   return backupPath;
 }
 
