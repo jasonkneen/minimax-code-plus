@@ -46,6 +46,7 @@ export function resolveMCodeOAuthEndpointConfig(
     environment.MCODE_OAUTH_REVOCATION_ENDPOINT,
   ];
   if (configuredValues.every((value) => !value?.trim())) {
+    assertBuildEnvAuthorised(context.buildEnv);
     const accountOrigin = ACCOUNT_ORIGINS[context.region][context.buildEnv];
     return {
       deviceAuthorizationEndpoint: `${accountOrigin}/oauth2/device/code`,
@@ -65,12 +66,35 @@ export function resolveMCodeOAuthEndpointConfig(
       'Shared MCode OAuth requires all three public OAuth endpoints to be configured.',
     );
   }
+  // Even when endpoints are explicit, the staging build-env still demands the
+  // pre-release header — refuse the request when the caller asked for an
+  // unauthorised environment so an attacker cannot bypass the gate by
+  // supplying custom endpoints while keeping `buildEnv=staging` semantics.
+  assertBuildEnvAuthorised(context.buildEnv);
   return {
     deviceAuthorizationEndpoint,
     ...deviceAuthorizationRequestConfig(context.buildEnv),
     tokenEndpoint,
     revocationEndpoint,
   };
+}
+
+/**
+ * Refuse dev/test builds unless the host has explicitly opted in via
+ * `MAVIS_DEV_OAUTH_OK=1`. Without this gate, a developer who runs a build
+ * with an unset `MAVIS_BUILD_ENV` (which falls through to `dev`) silently
+ * gets OAuth endpoints that resolve to `*.example.invalid` and never warns;
+ * the same fallback is what an attacker would piggy-back on to mint staging
+ * credentials by setting `MAVIS_REGION=en` while leaving the rest of the
+ * environment pointing at staging.
+ */
+function assertBuildEnvAuthorised(buildEnv: AuthBuildEnv): void {
+  if (buildEnv === 'prod' || buildEnv === 'staging') return;
+  if (process.env.MAVIS_DEV_OAUTH_OK === '1') return;
+  throw new TypeError(
+    `Refusing to construct the Shared MCode OAuth client for buildEnv='${buildEnv}'. ` +
+      `Dev/test builds must set MAVIS_DEV_OAUTH_OK=1 to opt in.`,
+  );
 }
 
 function deviceAuthorizationRequestConfig(

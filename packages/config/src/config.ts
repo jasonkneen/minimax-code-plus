@@ -131,8 +131,16 @@ export function getRuntimeRegion(): MavisRegion {
 }
 
 export function getRuntimeBuildEnv(): MavisBuildEnv {
-  const val = process.env.MAVIS_BUILD_ENV;
-  if (isValidRuntimeBuildEnv(val)) return val;
+  // MAVIS_BUILD_ENV is only honored when the caller explicitly opted in via
+  // the `--env` CLI flag (mirroring how `packages/tui/src/cli/environment.ts`
+  // gates the TUI's `--lane` / `--env` startup flag). Without this guard a
+  // child process that inherits `MAVIS_BUILD_ENV=staging` from a parent shell
+  // would silently redirect the runtime at the staging host and let a
+  // caller mint auth tokens with staging credentials.
+  if (hasCliFlag("env")) {
+    const val = process.env.MAVIS_BUILD_ENV;
+    if (isValidRuntimeBuildEnv(val)) return val;
+  }
 
   if (isElectronProcess()) {
     const nextBuildEnv = process.env.NEXT_PUBLIC_BUILD_ENV;

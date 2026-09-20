@@ -123,14 +123,38 @@ export async function callSafetyApi(input: {
   )
     ? "?require_auth=true"
     : "";
-  const url = `${resolveSafetyApiBase(region(), resolvedBuildEnv, input.testBaseURL)}/mavis/api/v1/content${authQuery}`;
+  const resolvedBase = resolveSafetyApiBase(
+    region(),
+    resolvedBuildEnv,
+    input.testBaseURL,
+  );
+  const url = `${resolvedBase}/mavis/api/v1/content${authQuery}`;
   // Shared OAuth resource requests authenticate with the standard Bearer
   // scheme, matching the managed model and File API paths. Omit the header
   // entirely when there is no token so an anonymous request stays explicit.
-  const accessToken =
-    input.authContext?.accessToken?.trim() ||
-    process.env.MAVIS_ACCESS_TOKEN?.trim();
+  //
+  // The `MAVIS_ACCESS_TOKEN` env-var fallback is restricted to:
+  //   1. managed runtimes (`__MAVIS_RUNTIME_MANAGED=1`), which the TUI sets
+  //      when it has already proven the user is in a managed desktop session
+  //      — without the marker, an attacker who can set env vars on a
+  //      developer machine becomes an authenticated managed client.
+  //   2. requests whose resolved origin is on the managed-host allowlist
+  //      (`agent.minimax.cn` for the CN managed runtime, `agent.minimax.io`
+  //      for the global one) — staging/test origins are excluded so a token
+  //      from a developer `pnpm dev` can never reach a staging host.
+  const managedRuntimeToken =
+    process.env.__MAVIS_RUNTIME_MANAGED === "1" &&
+    isManagedSafetyApiOrigin(resolvedBase)
+      ? process.env.MAVIS_ACCESS_TOKEN?.trim()
+      : undefined;
+  const accessToken = input.authContext?.accessToken?.trim() || managedRuntimeToken;
   const reportFailure = createSafetyFailureReporter(url, "v1", input.scene);
+  // TODO(shared-oauth): Remove this local-only diagnostic after the content-safety
+  // resource server accepts mcode-public Bearer tokens in the joint test environment.
+  // Never add the token, request body/content, or response body to these fields.
+  const logLocalUpstream =
+    resolvedBuildEnv === "dev" || resolvedBuildEnv === "test";
+  const startedAt = Date.now();
   let response: Response;
   try {
     response = await input.fetchImpl(url, {
@@ -312,9 +336,13 @@ export function createContentSafetyChecker(deps: {
   return async (content, scene) => {
     try {
       const authContext = deps.authContextGetter?.();
+      // Mirror the `callSafetyApi` Bearer policy: only honor the env-var
+      // fallback in managed runtimes, so an auth-invalidator never hands a
+      // token from a non-managed caller back to the gateway.
+      const rejectedBuildEnv = (deps.buildEnv ?? getRuntimeBuildEnv)();
       const rejectedToken =
         authContext?.accessToken?.trim() ||
-        process.env.MAVIS_ACCESS_TOKEN?.trim();
+        managedSafetyApiEnvToken(rejectedBuildEnv, deps.testBaseURLGetter?.());
       const request = {
         content,
         scene,
@@ -340,7 +368,7 @@ export function createContentSafetyChecker(deps: {
         const freshAuth = deps.authContextGetter?.();
         const freshToken =
           freshAuth?.accessToken?.trim() ||
-          process.env.MAVIS_ACCESS_TOKEN?.trim();
+          managedSafetyApiEnvToken(rejectedBuildEnv, deps.testBaseURLGetter?.());
         if (!freshToken || freshToken === rejectedToken) return result;
         // A failed V2 output stream retries as its V2 full-reply scene after auth refresh.
         const retryScene =
@@ -373,4 +401,35 @@ function readErrorText(text: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Managed-host origins that are permitted to receive a `MAVIS_ACCESS_TOKEN`
+ * env-var credential. Stage/test origins are intentionally excluded: a
+ * staging token on a developer `pnpm dev` would otherwise let a developer
+ * machine authenticate against the staging gateway without an explicit
+ * managed-runtime opt-in.
+ */
+const MANAGED_SAFETY_API_ORIGINS: ReadonlySet<string> = new Set([
+  "https://agent.minimax.cn",
+  "https://agent.minimax.io",
+]);
+
+function isManagedSafetyApiOrigin(baseURL: string): boolean {
+  try {
+    return MANAGED_SAFETY_API_ORIGINS.has(new URL(baseURL).origin);
+  } catch {
+    return false;
+  }
+}
+
+function managedSafetyApiEnvToken(
+  buildEnv: MavisBuildEnv,
+  testBaseURL: string | undefined,
+): string | undefined {
+  if (process.env.__MAVIS_RUNTIME_MANAGED !== "1") return undefined;
+  const region = getRuntimeRegion();
+  const base = resolveSafetyApiBase(region, buildEnv, testBaseURL);
+  if (!isManagedSafetyApiOrigin(base)) return undefined;
+  return process.env.MAVIS_ACCESS_TOKEN?.trim() || undefined;
 }
