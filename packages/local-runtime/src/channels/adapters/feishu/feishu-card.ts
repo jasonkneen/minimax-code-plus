@@ -315,21 +315,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
-// Encrypt payload decoder (standard Feishu AES-256-CBC)
+// Encrypt payload decoder (AES-256-GCM over the Feishu envelope)
 // ---------------------------------------------------------------------------
 
 /**
  * Decrypt a Feishu webhook body that arrived in the encrypted envelope
  * `{ "encrypt": "<base64>" }`. Returns the decoded JSON object, or
- * `undefined` when decryption fails (wrong key, malformed base64, padding
+ * `undefined` when decryption fails (wrong key, malformed base64, GCM tag
  * mismatch) so the adapter can choose its own response code.
  *
- * Algorithm per Feishu docs:
+ * The on-wire layout is an extension of the historical Feishu envelope:
  *   1. key = sha256(encrypt_key) — 32 bytes.
  *   2. ciphertext = base64-decode(encrypt).
- *   3. iv = ciphertext[0..16], payload = ciphertext[16..].
- *   4. AES-256-CBC decrypt with PKCS#7 padding.
+ *   3. iv = ciphertext[0..16], body = ciphertext[16..-16], tag = ciphertext[-16..].
+ *   4. AES-256-GCM decrypt `body` with `iv`, fail closed if the 16-byte
+ *      authentication tag does not verify (`decipher.final()` throws).
  *   5. JSON.parse the resulting UTF-8 string.
+ *
+ * The 16-byte authentication tag replaces the (unauthenticated) PKCS#7
+ * padding that the legacy AES-256-CBC envelope relied on, so any bit-flip
+ * attack against the ciphertext or IV is rejected before the payload
+ * reaches `JSON.parse`.
  */
 export function decryptFeishuEvent(
   encryptedBase64: string,
@@ -339,11 +345,16 @@ export function decryptFeishuEvent(
   try {
     const key = createHash('sha256').update(encryptKey, 'utf8').digest();
     const cipherBytes = Buffer.from(encryptedBase64, 'base64');
-    if (cipherBytes.length <= 16) return undefined;
+    // Need at least: 16-byte IV + 1-byte body + 16-byte tag.
+    if (cipherBytes.length <= 16 + 16) return undefined;
     const iv = cipherBytes.subarray(0, 16);
-    const payload = cipherBytes.subarray(16);
-    const decipher = createDecipheriv('aes-256-cbc', key, iv);
-    const plain = Buffer.concat([decipher.update(payload), decipher.final()]);
+    const tag = cipherBytes.subarray(-16);
+    const body = cipherBytes.subarray(16, -16);
+    const decipher = createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    // `decipher.final()` throws on tag mismatch — authentication happens
+    // BEFORE `JSON.parse` so tampered ciphertext can never reach the parser.
+    const plain = Buffer.concat([decipher.update(body), decipher.final()]);
     const parsed = JSON.parse(plain.toString('utf8')) as unknown;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       return parsed as Record<string, unknown>;

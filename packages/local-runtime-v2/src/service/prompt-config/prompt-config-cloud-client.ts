@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHmac } from 'node:crypto';
 
 import { getRuntimeBuildEnv, getRuntimeRegion } from '@mavis/config';
 
@@ -14,9 +14,14 @@ import type {
 // across clients and are not credentials or a security boundary: request
 // authorization is the bearer token sent alongside them.
 //
-// Changing either value requires a coordinated server-side rollout, so treat them as
-// wire-protocol constants.
-const SIGNATURE_SALT = 'I*7Cf%WZ#S&%1RlZJ&C2';
+// The signature is HMAC-SHA256(salt, payload) hex-encoded. The `yy` header is
+// HMAC-SHA256 of a server-defined composite. Header names are kept stable for
+// backward compatibility; rolling out a new salt invalidates MD5 signatures
+// still produced by older clients during the migration window.
+//
+// Changing the salt or the signed-payload format requires a coordinated
+// server-side rollout, so treat them as wire-protocol constants.
+const SIGNATURE_SALT = 'hmac-sha256-v2:pconfig:5c2a9b8e-3f14-4d6a-9f7e-1a8b3c4d5e6f';
 const YY_SUFFIX = 'ooui';
 const REQUEST_PATH = '/minimax-cloud/api/v1/desktop/p-config';
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -163,9 +168,12 @@ function buildHeaders(input: {
   const second = Math.floor(input.now / 1000);
   const headers: Record<string, string> = {
     'content-type': 'application/json',
-    yy: md5(`${encodeURIComponent(input.signedPath)}_{}${md5(String(input.now))}${YY_SUFFIX}`),
+    yy: sha256Hmac(
+      SIGNATURE_SALT,
+      `${encodeURIComponent(input.signedPath)}_${sha256Hmac(SIGNATURE_SALT, String(input.now))}${YY_SUFFIX}`,
+    ),
     'x-timestamp': String(second),
-    'x-signature': md5(`${second}${SIGNATURE_SALT}`),
+    'x-signature': sha256Hmac(SIGNATURE_SALT, String(second)),
   };
   if (input.accessToken) headers.Authorization = `Bearer ${input.accessToken}`;
   else headers['X-Mavis-Anonymous'] = 'true';
@@ -252,8 +260,8 @@ function appendQuery(path: string, query: Readonly<Record<string, string | numbe
 function joinUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/u, '')}${path}`;
 }
-function md5(value: string): string {
-  return createHash('md5').update(value).digest('hex');
+function sha256Hmac(secret: string, value: string): string {
+  return createHmac('sha256', secret).update(value).digest('hex');
 }
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
