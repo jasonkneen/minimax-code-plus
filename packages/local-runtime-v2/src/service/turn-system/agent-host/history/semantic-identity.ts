@@ -1,9 +1,13 @@
+import { types } from 'node:util';
 import { IncrementalSha256 } from './incremental-sha256.js';
 
 export interface SemanticSnapshot<T> {
   readonly value: T;
   readonly fingerprint: string;
 }
+
+const ownedValues = new WeakSet<object>();
+const fingerprints = new WeakMap<object, string>();
 
 /**
  * Detach callback-owned History/event data before it becomes an in-run
@@ -12,13 +16,96 @@ export interface SemanticSnapshot<T> {
  * encoded payload size.
  */
 export function captureSemanticSnapshot<T>(value: T): SemanticSnapshot<T> {
-  const snapshot = structuredClone(value);
-  const encoder = new SemanticIdentityEncoder(new IncrementalSha256());
-  encodeValue(snapshot, new WeakSet<object>(), encoder);
+  // Native cloning preserves external getters and aliases. Data-only wrappers
+  // can instead share descendants already detached and frozen by this module.
+  const snapshot =
+    typeof value === 'object' && value !== null && ownedValues.has(value)
+      ? value
+      : freezeSemanticValue(
+          cloneOwnedWrapper(value) ?? structuredClone(value),
+          new WeakSet<object>(),
+        );
+  let fingerprint: string | undefined;
   return {
-    value: freezeSemanticValue(snapshot, new WeakSet<object>()),
-    fingerprint: encoder.digest(),
+    value: snapshot,
+    // Value-only consumers still validate and detach eagerly, but never encode
+    // or hash the history. Only values frozen by this module may be reused.
+    get fingerprint() {
+      if (fingerprint !== undefined) return fingerprint;
+      const object = typeof snapshot === 'object' && snapshot !== null ? snapshot : undefined;
+      fingerprint = object ? fingerprints.get(object) : undefined;
+      if (fingerprint === undefined) {
+        const encoder = new SemanticIdentityEncoder(new IncrementalSha256());
+        encodeValue(snapshot, new WeakSet<object>(), encoder);
+        fingerprint = encoder.digest();
+        if (object) fingerprints.set(object, fingerprint);
+      }
+      return fingerprint;
+    },
   };
+}
+
+const NATIVE_CLONE_REQUIRED = Symbol('native-clone-required');
+
+function plainDataDescriptors(value: object): PropertyDescriptorMap | undefined {
+  // Inspecting a Proxy would invoke traps that native structuredClone rejects.
+  if (types.isProxy(value)) return undefined;
+  const prototype = Object.getPrototypeOf(value);
+  if (
+    prototype !== Object.prototype &&
+    prototype !== null &&
+    !(Array.isArray(value) && prototype === Array.prototype)
+  )
+    return undefined;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Object.values(descriptors).some((d) => d.enumerable && !('value' in d))) return undefined;
+  return descriptors;
+}
+
+function cloneOwnedWrapper<T>(value: T): T | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const descriptors = plainDataDescriptors(value);
+  if (
+    !descriptors ||
+    !Object.values(descriptors).some(
+      (d) =>
+        d.enumerable && typeof d.value === 'object' && d.value !== null && ownedValues.has(d.value),
+    )
+  )
+    return undefined;
+
+  const copies = new WeakMap<object, object>();
+  const clone = (node: unknown): unknown => {
+    if (typeof node !== 'object' || node === null) {
+      if (node !== null && !['undefined', 'string', 'boolean', 'number'].includes(typeof node)) {
+        throw NATIVE_CLONE_REQUIRED;
+      }
+      return node;
+    }
+    if (ownedValues.has(node)) return node;
+    const previous = copies.get(node);
+    if (previous) return previous;
+    const fields = node === value ? descriptors : plainDataDescriptors(node);
+    if (!fields) throw NATIVE_CLONE_REQUIRED;
+    const copy = Array.isArray(node) ? new Array(fields.length!.value as number) : {};
+    copies.set(node, copy);
+    for (const [key, field] of Object.entries(fields)) {
+      if (!field.enumerable) continue;
+      Object.defineProperty(copy, key, {
+        value: clone(field.value),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+    return copy;
+  };
+  try {
+    return clone(value) as T;
+  } catch (error) {
+    if (error === NATIVE_CLONE_REQUIRED) return undefined;
+    throw error;
+  }
 }
 
 /**
@@ -54,13 +141,28 @@ class SemanticIdentityEncoder {
   }
 }
 
-function freezeSemanticValue<T>(value: T, seen: WeakSet<object>): T {
-  if (typeof value !== 'object' || value === null || seen.has(value)) return value;
-  seen.add(value);
-  Reflect.ownKeys(value).forEach((key) => {
-    freezeSemanticValue(Reflect.get(value, key), seen);
-  });
-  return Object.freeze(value);
+function freezeSemanticValue<T>(value: T, ancestors: WeakSet<object>): T {
+  if (typeof value !== 'object' || value === null) {
+    if (!['undefined', 'string', 'boolean', 'number'].includes(typeof value) && value !== null) {
+      throw new TypeError(`Unsupported semantic identity value: ${typeof value}.`);
+    }
+    return value;
+  }
+  if (ownedValues.has(value)) return value;
+  if (ancestors.has(value)) throw new TypeError('Cyclic semantic identity values are unsupported.');
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError('Semantic identity values must contain only plain objects and arrays.');
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new TypeError('Symbol-keyed semantic identity values are unsupported.');
+  }
+  ancestors.add(value);
+  for (const key of Object.keys(value)) freezeSemanticValue(Reflect.get(value, key), ancestors);
+  ancestors.delete(value);
+  Object.freeze(value);
+  ownedValues.add(value);
+  return value;
 }
 
 function encodeValue(

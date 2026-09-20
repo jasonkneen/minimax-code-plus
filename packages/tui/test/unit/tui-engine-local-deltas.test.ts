@@ -56,7 +56,7 @@ describe('MCode Pi Engine local deltas', () => {
     }
   });
 
-  it('preserves native scrollback when transient rows shrink above the viewport', async () => {
+  it('rebuilds when a transient collapse changes rows already in scrollback', async () => {
     const terminal = new RecordingVirtualTerminal(40, 5);
     const tui = new TuiMainScreen(terminal);
     const component = new MutableLines();
@@ -81,10 +81,162 @@ describe('MCode Pi Engine local deltas', () => {
 
     const writes = terminal.takeWrites();
     expect(writes).toContain('\x1b[2J\x1b[H');
-    expect(writes).not.toContain('\x1b[3J');
-    expect(terminal.getScrollBuffer()).toContain('activity-1');
+    expect(writes).toContain('\x1b[3J');
+    expect(terminal.getScrollBuffer()).not.toContain('activity-1');
     expect(terminal.getViewport()).toEqual(['header', 'status', 'composer', '', '']);
+    expect(terminal.getScrollBuffer().filter((line) => line === 'header')).toHaveLength(1);
     expect(tui.fullRedraws).toBe(2);
+  });
+
+  it('does not replay scrolled answer rows after a narrow terminal frame shrinks', async () => {
+    const terminal = new RecordingVirtualTerminal(67, 44);
+    const tui = new TuiMainScreen(terminal);
+    const component = new MutableLines();
+    const answer = Array.from({ length: 80 }, (_, index) => `Answer line ${index}`);
+    component.lines = [...answer, 'activity', `composer${CURSOR_MARKER}`, 'status'];
+    tui.addChild(component);
+    tui.renderNow();
+    await terminal.flush();
+
+    // Settle the activity row, then repaint a historical line (for example Markdown styling).
+    terminal.takeWrites();
+    component.lines = [...answer, `composer${CURSOR_MARKER}`, 'status'];
+    component.lines[0] = '\x1b[1mAnswer line 0\x1b[0m';
+    tui.renderNow();
+    await terminal.flush();
+    expect(terminal.takeWrites()).toContain('\x1b[3J');
+    component.lines[0] = '\x1b[1mAnswer line 0\x1b[0m';
+    tui.renderNow();
+    await terminal.flush();
+
+    expect(terminal.takeWrites()).not.toContain('\x1b[3J');
+    expect(terminal.getScrollBuffer()).toEqual([...answer, 'composer', 'status']);
+    expect(terminal.getViewport().at(-1)).toBe('status');
+    expect(terminal.getCursorPosition()).toEqual({ x: 8, y: 42 });
+
+    // A later burst must continue from the same logical/physical boundary.
+    component.lines.splice(80, 0, ...Array.from({ length: 50 }, (_, index) => `More ${index}`));
+    tui.renderNow();
+    await terminal.flush();
+    expect(terminal.getScrollBuffer()).toEqual([
+      ...answer,
+      ...Array.from({ length: 50 }, (_, index) => `More ${index}`),
+      'composer',
+      'status',
+    ]);
+  });
+
+  it.each([1, 8, 30])(
+    'keeps the composer and status at the bottom as %i running rows settle and new output grows',
+    async (activityRows) => {
+      const terminal = new RecordingVirtualTerminal(60, 44);
+      const tui = new TuiMainScreen(terminal);
+      const component = new MutableLines();
+      const answer = Array.from({ length: 80 }, (_, index) => `Answer ${index}`);
+      component.lines = [
+        ...answer,
+        ...Array.from({ length: activityRows }, (_, index) => `Activity ${index}`),
+        `composer${CURSOR_MARKER}`,
+        'running',
+      ];
+      tui.addChild(component);
+      tui.renderNow();
+      await terminal.flush();
+      terminal.takeWrites();
+
+      component.lines = [...answer, `composer${CURSOR_MARKER}`, 'idle'];
+      for (let added = 0; added <= activityRows + 1; added++) {
+        tui.renderNow();
+        await terminal.flush();
+        expect(terminal.getViewport()).toEqual(
+          component.lines.slice(-terminal.rows).map((line) => line.replace(CURSOR_MARKER, '')),
+        );
+        expect(terminal.getCursorPosition()).toEqual({ x: 8, y: 42 });
+        if (added === 0) expect(terminal.takeWrites()).toContain('\x1b[3J');
+        else expect(terminal.takeWrites()).not.toContain('\x1b[3J');
+        expect(terminal.getScrollBuffer()).toEqual(
+          component.lines.map((line) => line.replace(CURSOR_MARKER, '')),
+        );
+        if (added <= activityRows) component.lines.splice(-2, 0, `New answer ${added}`);
+      }
+      expect(terminal.getScrollBuffer()).not.toContain('');
+    },
+  );
+
+  it('keeps every appended row when a historical row changes in the same frame', async () => {
+    const terminal = new RecordingVirtualTerminal(67, 44);
+    const tui = new TuiMainScreen(terminal);
+    const component = new MutableLines();
+    const answer = Array.from({ length: 80 }, (_, index) => `Answer line ${index}`);
+    component.lines = [...answer, 'composer'];
+    tui.addChild(component);
+    tui.renderNow();
+    await terminal.flush();
+    terminal.takeWrites();
+
+    const more = Array.from({ length: 50 }, (_, index) => `More ${index}`);
+    component.lines = [...answer, ...more, 'composer'];
+    component.lines[0] = '\x1b[1mAnswer line 0\x1b[0m';
+    tui.renderNow();
+    await terminal.flush();
+
+    expect(terminal.takeWrites()).not.toContain('\x1b[3J');
+    expect(terminal.getScrollBuffer()).toEqual([...answer, ...more, 'composer']);
+  });
+
+  it('rebuilds the document when shrinking leaves no rows in the previous viewport', async () => {
+    const terminal = new RecordingVirtualTerminal(67, 44);
+    const tui = new TuiMainScreen(terminal);
+    const component = new MutableLines();
+    component.lines = Array.from({ length: 100 }, (_, index) => `Old line ${index}`);
+    tui.addChild(component);
+    tui.renderNow();
+    await terminal.flush();
+
+    component.lines = ['answer', `composer${CURSOR_MARKER}`];
+    tui.renderNow();
+    await terminal.flush();
+
+    expect(terminal.getScrollBuffer().filter(Boolean)).toEqual(['answer', 'composer']);
+    expect(terminal.getCursorPosition()).toEqual({ x: 8, y: 1 });
+  });
+
+  it('still previews the resized tail and restores ordered scrollback after resize settles', async () => {
+    const terminal = new RecordingVirtualTerminal(67, 44);
+    const tui = new TuiMainScreen(terminal);
+    const component = new MutableLines();
+    component.lines = [
+      ...Array.from({ length: 80 }, (_, index) => `Answer line ${index}`),
+      `composer${CURSOR_MARKER}`,
+    ];
+    tui.addChild(component);
+    try {
+      tui.start();
+      tui.renderNow();
+      await terminal.flush();
+      terminal.takeWrites();
+
+      terminal.resize(60, 30);
+      tui.renderNow();
+      await terminal.flush();
+      expect(terminal.takeWrites()).not.toContain('\x1b[3J');
+      expect(terminal.getViewport()).toEqual([
+        ...Array.from({ length: 29 }, (_, index) => `Answer line ${index + 51}`),
+        'composer',
+      ]);
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 200));
+      tui.renderNow();
+      await terminal.flush();
+      expect(terminal.takeWrites()).toContain('\x1b[3J');
+      expect(terminal.getScrollBuffer()).toEqual([
+        ...Array.from({ length: 80 }, (_, index) => `Answer line ${index}`),
+        'composer',
+      ]);
+      expect(terminal.getCursorPosition()).toEqual({ x: 8, y: 29 });
+    } finally {
+      tui.stop();
+    }
   });
 
   it('renders an urgent product interaction without resetting Main diff state', async () => {

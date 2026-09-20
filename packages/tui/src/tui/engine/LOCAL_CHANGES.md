@@ -106,3 +106,20 @@ Remove `L024` when the selected Pi baseline natively matches legacy-terminal `Ct
 - Change: strip leading zone prefixes before comparing screen lines, so initial frames, differential redraws, and history caches stay clean. Fullscreen behavior is unchanged.
 - Evidence: `test/unit/tui-engine-local-deltas.test.ts` checks initial and differential writes.
 - Removal condition: the selected Pi baseline supplies equivalent normal-mode filtering.
+
+## L035: Fullscreen scrollbar track interaction
+
+- Origin: adapted from [drowzeys/minimax-code commit 0b24a7778741fda335a9a2074464c69911feb1aa](https://github.com/drowzeys/minimax-code/commit/0b24a7778741fda335a9a2074464c69911feb1aa), contributed by drowzeys under the existing MIT license in [issue #216](https://github.com/MiniMax-AI/minimax-code/issues/216).
+- Product contract: the fullscreen transcript enables an always-visible scrollbar with a three-column hit gutter. Track presses center the thumb and jump before dragging; thumb presses retain their grab offset without an initial jump.
+- Minimal difference: `components/scroll-view.ts` accepts an optional `scrollbarGutter` for always-visible bars, defaulting to one column and retaining at least one content column on narrow terminals. `tui-alt-screen.ts` restricts wide hit targets to that reserved gutter, factors drag mapping into `dragScrollbarTo`, and cancels a drag when an overlay receives the next mouse event. Auto bars retain a one-column target. `layout.ts` stays at the Pi baseline.
+- Adaptation: the original contribution widened hits over two live content columns. The reserved gutter prevents those presses from swallowing content clicks or text selection. `chat-layout.ts` opts into the three-column gutter.
+- Evidence: `test/unit/tui-scrollbar-interaction.test.ts` drives SGR press, motion, release and wheel events through VirtualTerminal, covering track jumps, thumb grabs, narrow terminals, content routing, selection, overlays and the actual fullscreen ChatLayout.
+- Removal condition: the selected Pi baseline provides equivalent reserved-gutter track and drag interaction and MCode migrates to it.
+
+## L034: Regular viewport reconstruction after document shrink
+
+- Product contract: after running content or a feature panel closes, show the complete current chat viewport with its Composer and status line. Every current-session row must occur once in native history.
+- Minimal difference: when a shorter document would move the viewport origin backwards, clear and replay the complete current projection. Other updates retain differential rendering and resize retains the existing delayed history replay.
+- Tradeoff: structural reconstruction clears native scrollback, including shell history from before TUI startup. Initial short chat documents retain natural document placement.
+- Evidence: local-delta tests assert every visible row and the complete history, while real Tasks and feature lifecycle tests cover short/long content, background growth, paging, resize, nested panels and return to chat. Virtual terminals do not establish native iTerm2 touchpad acceptance.
+- Removal condition: the selected Pi baseline provides equivalent complete viewport and unique-history behavior.
