@@ -1133,13 +1133,21 @@ function evaluateSingleSubcommand(
 
   // -------- COMMON LAYER --------
 
+  // Every rule behavior sees the same raw and transparent-wrapper-stripped
+  // forms. Otherwise a wrapped command could skip deny/ask and match allow.
+  const wrapperStrippedCommand = stripTransparentWrappersForRuleMatch(command);
+  const matchesUserRule = (parsedRule: CompiledShellPermissionRule | undefined): boolean =>
+    !!parsedRule &&
+    (matchShellRule(command, parsedRule) ||
+      (!!wrapperStrippedCommand && matchShellRule(wrapperStrippedCommand, parsedRule)));
+
   // Step 1: user deny rule
   for (const { rule, parsedRule } of bashRules) {
     if (rule.ruleBehavior !== 'deny') continue;
     if (!rule.ruleValue.ruleContent) {
       return logLayer('user-deny', { verdict: 'deny', reason: { type: 'rule', rule } });
     }
-    if (parsedRule && matchShellRule(command, parsedRule)) {
+    if (matchesUserRule(parsedRule)) {
       return logLayer('user-deny', { verdict: 'deny', reason: { type: 'rule', rule } });
     }
   }
@@ -1150,7 +1158,7 @@ function evaluateSingleSubcommand(
     if (!rule.ruleValue.ruleContent) {
       return logLayer('user-ask', { verdict: 'ask', reason: { type: 'rule', rule } });
     }
-    if (parsedRule && matchShellRule(command, parsedRule)) {
+    if (matchesUserRule(parsedRule)) {
       return logLayer('user-ask', { verdict: 'ask', reason: { type: 'rule', rule } });
     }
   }
@@ -1301,20 +1309,13 @@ function evaluateSingleSubcommand(
     });
   }
 
-  // Step 5: user allow rule. Match against the original command first;
-  // if a transparent wrapper prefixes the line (nohup/setsid/timeout/xargs/...),
-  // also match the stripped form so `pnpm:*` covers `nohup pnpm install`.
-  // Privilege wrappers (sudo / bash -c / env K=V) are not stripped.
-  const wrapperStrippedCommand = stripTransparentWrappersForRuleMatch(command);
+  // Step 5: user allow rule, using the same command forms as deny/ask above.
   for (const { rule, parsedRule } of bashRules) {
     if (rule.ruleBehavior !== 'allow') continue;
     if (!rule.ruleValue.ruleContent) {
       return logLayer('user-allow', { verdict: 'allow', reason: { type: 'rule', rule } });
     }
-    if (
-      (parsedRule && matchShellRule(command, parsedRule)) ||
-      (wrapperStrippedCommand && parsedRule && matchShellRule(wrapperStrippedCommand, parsedRule))
-    ) {
+    if (matchesUserRule(parsedRule)) {
       return logLayer('user-allow', { verdict: 'allow', reason: { type: 'rule', rule } });
     }
   }

@@ -3,6 +3,7 @@ import {
   type RunawayGuardSettings,
 } from "./runaway-guard-config.js";
 import fs from "node:fs";
+import { restrictConfigFileSync, writePrivateConfigFileSync } from "./private-config-file.js";
 import path from "node:path";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
@@ -13,6 +14,7 @@ import {
   applyManagedMinimaxContextLimits,
   applyRequiredProviderOverrides,
   migrateLegacyByokProvidersOnDisk,
+  restrictLegacyByokBackups,
   normalizeLegacyThinkingEfforts,
   parseCustomProvidersConfig,
   parseMinimaxApiConfig,
@@ -1648,10 +1650,9 @@ function syncManagedPresetBaseUrl(configPath: string): void {
     return;
 
   (options as Record<string, unknown>).baseURL = presetBaseURL;
-  fs.writeFileSync(
+  writePrivateConfigFileSync(
     configPath,
     yaml.dump(raw, { indent: 2, lineWidth: -1, noRefs: true }),
-    "utf-8",
   );
 }
 
@@ -1830,7 +1831,8 @@ function ensureConfigFile(): void {
     const defaultDataDir = resolveDataDir({ homeDir: os.homedir() });
     const defaultConfigPath = path.join(defaultDataDir, "config.yaml");
     if (configPath !== defaultConfigPath && fs.existsSync(defaultConfigPath)) {
-      fs.copyFileSync(defaultConfigPath, configPath);
+      restrictConfigFileSync(defaultConfigPath);
+      writePrivateConfigFileSync(configPath, fs.readFileSync(defaultConfigPath), true);
     }
     return;
   }
@@ -1841,7 +1843,7 @@ function ensureConfigFile(): void {
     provider: managedPresetBaseUrlSyncEnabled ? preset.provider : undefined,
     defaultModel: preset.defaultModel,
   });
-  fs.writeFileSync(configPath, content, "utf-8");
+  writePrivateConfigFileSync(configPath, content, true);
 }
 
 function readConfigFile(configPath = getConfigPath()): Record<string, unknown> {
@@ -1897,6 +1899,8 @@ export function setManagedPresetBaseUrlSyncEnabled(enabled: boolean): void {
 }
 
 export function prepareConfigFileForRead(configPath: string): void {
+  restrictConfigFileSync(configPath);
+  restrictLegacyByokBackups(configPath);
   if (legacyByokProviderMigrationEnabled) {
     migrateLegacyByokProvidersOnDisk(
       configPath,

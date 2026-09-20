@@ -224,6 +224,7 @@ function cloneContextWith(
     trustedExactWritePaths: ctx.trustedExactWritePaths,
     dataDir: ctx.dataDir,
     homeDir: ctx.homeDir,
+    isFile: ctx.isFile,
     agentName: ctx.agentName,
     sessionId: ctx.sessionId,
     allowManagedPermissionRulesOnly: ctx.allowManagedPermissionRulesOnly,
