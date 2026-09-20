@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import fs, { existsSync, readFileSync } from 'node:fs';
+import fs from 'node:fs';
 import { dirname, join } from 'node:path';
 import { getConfig, getConfigPath, MINIMAX_API_MODEL_CATALOG, resetConfig } from '@mavis/config';
 import yaml from 'js-yaml';
@@ -81,6 +81,7 @@ export async function updateLocalConfigFile(
   try {
     await fs.promises.mkdir(dirname(configPath), { recursive: true });
     await fs.promises.writeFile(configPath, '', { flag: 'a', mode: LOCAL_CONFIG_FILE_MODE });
+    await fs.promises.chmod(configPath, LOCAL_CONFIG_FILE_MODE);
     release = await lockfile.lock(configPath, {
       stale: 10_000,
       retries: { retries: 20, factor: 1, minTimeout: 5, maxTimeout: 25 },
@@ -138,6 +139,7 @@ export async function compareAndSetLocalModelContext(
   try {
     await fs.promises.mkdir(dirname(configPath), { recursive: true });
     await fs.promises.writeFile(configPath, '', { flag: 'a', mode: LOCAL_CONFIG_FILE_MODE });
+    await fs.promises.chmod(configPath, LOCAL_CONFIG_FILE_MODE);
     release = await lockfile.lock(configPath, {
       stale: 10_000,
       retries: { retries: 20, factor: 1, minTimeout: 5, maxTimeout: 25 },
@@ -229,6 +231,7 @@ export async function updateLocalByokConfig(
   try {
     await fs.promises.mkdir(dirname(configPath), { recursive: true });
     await fs.promises.writeFile(configPath, '', { flag: 'a', mode: LOCAL_CONFIG_FILE_MODE });
+    await fs.promises.chmod(configPath, LOCAL_CONFIG_FILE_MODE);
     release = await lockfile.lock(configPath, {
       stale: 10_000,
       retries: { retries: 20, factor: 1, minTimeout: 5, maxTimeout: 25 },
@@ -288,34 +291,40 @@ export async function updateLocalByokConfig(
 
 export async function atomicWriteFile(filePath: string, content: string): Promise<void> {
   const tmpPath = join(dirname(filePath), `.config-tmp-${randomBytes(6).toString('hex')}`);
+  let created = false;
   try {
-    const mode = await readFilePermissionMode(filePath);
-    await fs.promises.writeFile(tmpPath, content, { encoding: 'utf-8', mode });
-    await fs.promises.chmod(tmpPath, mode);
+    const mode = LOCAL_CONFIG_FILE_MODE;
+    const temporary = await fs.promises.open(tmpPath, 'wx', mode);
+    created = true;
+    try {
+      await temporary.writeFile(content, 'utf-8');
+      await temporary.chmod(mode);
+    } finally {
+      await temporary.close();
+    }
     await fs.promises.rename(tmpPath, filePath);
   } catch {
-    await fs.promises.unlink(tmpPath).catch(() => undefined);
+    if (created) await fs.promises.unlink(tmpPath).catch(() => undefined);
     throw new LocalConfigWriteError();
   }
 }
 
-async function readFilePermissionMode(filePath: string): Promise<number> {
-  try {
-    return (await fs.promises.stat(filePath)).mode & 0o777;
-  } catch (err) {
-    if (isNodeError(err) && err.code === 'ENOENT') return LOCAL_CONFIG_FILE_MODE;
-    throw err;
-  }
-}
-
 function readLocalRawConfig(configPath: string): Record<string, unknown> {
-  if (!existsSync(configPath)) return {};
+  // Callers create missing files before locking. A read failure must abort the
+  // update rather than turn an existing configuration into an empty document.
+  const source = fs.readFileSync(configPath, 'utf-8');
+  let parsed: unknown;
   try {
-    const parsed = yaml.load(readFileSync(configPath, 'utf-8'));
-    return isPlainRecord(parsed) ? parsed : {};
+    parsed = yaml.load(source);
   } catch {
-    return {};
+    // YAML errors include source snippets, which may contain credentials.
+    throw new LocalConfigValidationError('Invalid config.yaml: unable to parse YAML');
   }
+  if (parsed == null) return {};
+  if (!isPlainRecord(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype) {
+    throw new LocalConfigValidationError('Invalid config.yaml: expected a YAML mapping');
+  }
+  return parsed;
 }
 
 function applyLocalConfigUpdate(raw: Record<string, unknown>, body: Record<string, unknown>): void {
@@ -474,10 +483,6 @@ function ensurePlainRecordChild(
 function toLocalConfigError(err: unknown): Error {
   if (err instanceof LocalConfigValidationError || err instanceof LocalConfigWriteError) return err;
   return new LocalConfigWriteError();
-}
-
-function isNodeError(err: unknown): err is NodeJS.ErrnoException {
-  return err instanceof Error && 'code' in err;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

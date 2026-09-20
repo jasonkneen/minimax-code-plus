@@ -11,10 +11,12 @@ export async function writeTuiStatusLineSetting(
 ): Promise<void> {
   const configPath = join(dataDir, 'config.yaml');
   let temporaryPath: string | undefined;
+  let temporaryCreated = false;
   let release: (() => Promise<void>) | undefined;
   try {
     await fs.mkdir(dataDir, { recursive: true });
     await fs.writeFile(configPath, '', { flag: 'a', mode: 0o600 });
+    await fs.chmod(configPath, 0o600);
     // Replace the real file, preserving any symlink used to manage profile settings.
     // Keep the temporary file on the target filesystem so rename remains atomic.
     const targetPath = await fs.realpath(configPath);
@@ -33,12 +35,15 @@ export async function writeTuiStatusLineSetting(
     if (items === undefined) delete nextTui.statusLine;
     else nextTui.statusLine = [...items];
     const next = { ...document, tui: nextTui };
-    const mode = (await fs.stat(targetPath)).mode & 0o777;
-    await fs.writeFile(temporaryPath, yaml.dump(next, { lineWidth: -1, noRefs: true }), {
-      encoding: 'utf8',
-      mode,
-    });
-    await fs.chmod(temporaryPath, mode);
+    const mode = 0o600;
+    const temporary = await fs.open(temporaryPath, 'wx', mode);
+    temporaryCreated = true;
+    try {
+      await temporary.writeFile(yaml.dump(next, { lineWidth: -1, noRefs: true }), 'utf8');
+      await temporary.chmod(mode);
+    } finally {
+      await temporary.close();
+    }
     await fs.rename(temporaryPath, targetPath);
   } catch {
     // Parser errors can contain unrelated credentials from the config source.
@@ -46,7 +51,7 @@ export async function writeTuiStatusLineSetting(
       'Unable to save status line settings. Check config.yaml syntax and permissions.',
     );
   } finally {
-    if (temporaryPath) await fs.unlink(temporaryPath).catch(() => undefined);
+    if (temporaryCreated && temporaryPath) await fs.unlink(temporaryPath).catch(() => undefined);
     await release?.().catch(() => undefined);
   }
 }

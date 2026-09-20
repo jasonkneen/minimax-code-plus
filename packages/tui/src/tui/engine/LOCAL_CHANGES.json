@@ -48,6 +48,13 @@
       "behaviorImpact": "MCode keeps its compact code presentation without reimplementing Pi Markdown or leaking wrapped link styles into table borders and adjacent cells. 链接保留嵌套强调与行内代码，并在结束后恢复外层样式。 保留两个尾部块并对引用回退全文。"
     },
     {
+      "path": "components/scroll-view.ts",
+      "currentSha256": "6f82fb1f426fdf81ca7058e6a1ea4a94c9ddd8f0e15d69c9020f9c66ca5411dd",
+      "changeIds": ["L035"],
+      "reason": "Allow hosts to reserve a wider always-visible scrollbar gutter while retaining at least one content column.",
+      "behaviorImpact": "The fullscreen transcript reserves three columns; other scroll views retain the default one-column gutter."
+    },
+    {
       "path": "components/settings-list.ts",
       "currentSha256": "959f7db23190e0e526ca84c3032443d7d15248d891809f28c837cfa958692b5c",
       "changeIds": ["L005"],
@@ -148,19 +155,19 @@
     },
     {
       "path": "tui-alt-screen.ts",
-      "currentSha256": "dd8acaa441bab2e674e6cba946dcb130b97e51098adf158bda1f73bd027d7a4b",
-      "changeIds": ["L005", "L011", "L019", "L020", "L025", "L031"],
+      "currentSha256": "b1e6b332e976c5224f77ce82ee850d35c601ad18c3719d9c824b7c9db1245a78",
+      "changeIds": ["L005", "L011", "L019", "L020", "L025", "L031", "L035"],
       "upstreamCommit": "4e494929998d6bc4fccf75e0a233f727db4b70ee,1ac6128e66bd44668b58db773c2a76c29163ade5",
-      "reason": "Keep strict TypeScript fixes and layout-first mouse dispatch, join path and kebab-case word segments, and expose configurable fullscreen selection copying helpers. 活动搜索索引与命中复用 独立面板声明键盘分页归属。",
-      "behaviorImpact": "Fullscreen product interaction clicks and Pi-owned text selection coexist; double-click selects complete path-like tokens, and hosts can disable automatic copy or copy an active selection explicitly. 搜索交互复用索引。 handlesViewportKeys 为 true 时，fullscreen 分页交给焦点面板；默认仍由外层视口处理。"
+      "reason": "Keep strict TypeScript fixes and layout-first mouse dispatch, join path and kebab-case word segments, and expose configurable fullscreen selection copying helpers. 活动搜索索引与命中复用 独立面板声明键盘分页归属。 Reserve scrollbar hit targets for gutter columns and support track jumps and thumb dragging.",
+      "behaviorImpact": "Fullscreen product interaction clicks and Pi-owned text selection coexist; double-click selects complete path-like tokens, and hosts can disable automatic copy or copy an active selection explicitly. 搜索交互复用索引。 handlesViewportKeys 为 true 时，fullscreen 分页交给焦点面板；默认仍由外层视口处理。 Fullscreen track presses jump and drag without consuming adjacent content; visible overlays cancel active scrollbar drags."
     },
     {
       "path": "tui-main-screen.ts",
-      "currentSha256": "146fd4222ae5a48d1f439de2f280b111789151a30c1bdd2735e32fff07329b9d",
+      "currentSha256": "daf48c4d9a594abd282d4d4fd855373d17cb1033d0b5bdc2396e1727c2186153",
       "changeIds": ["L005", "L017", "L027", "L033", "L034"],
       "upstreamCommit": "6c4f360264397c59801f6da2bdac13e3b1fcbe91",
       "reason": "Keep strict TypeScript fixes and stream full and differential renders through Pi's bounded terminal writer. 缩放期间仅重绘可见尾部 常规模式在差分比较前剥离行首 OSC 133 zone 标记。 内容收缩或历史内容变化触发回退重绘时仅更新可见区域。",
-      "behaviorImpact": "Large regular-mode renders preserve output order without constructing a single V8-limited terminal string. 150ms 后及退出前重放完整投影历史。 内部导航标记不再写入终端，避免 iTerm2 左侧箭头和命令条噪声。 Session 结束后的状态更新不再发送 ESC 3J 清除原生滚动历史，当前视口仍显示最新内容。"
+      "behaviorImpact": "Regular updates preserve native scrollback. When document shrink reveals previously scrolled rows, replay the complete current session to fill the viewport and avoid duplicate history. Rebuilding clears pre-launch shell scrollback. Resize retains the existing delayed history replay."
     },
     {
       "path": "tui.ts",
