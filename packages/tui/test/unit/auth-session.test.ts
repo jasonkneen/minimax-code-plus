@@ -53,8 +53,14 @@ describe('createMcodeSharedAuthSession', () => {
       generation: 1,
     });
     const raw = await readFile(namespace.credentialPath, 'utf8');
-    expect(raw).toContain('shared-access-token');
-    expect(raw).toContain('shared-refresh-token');
+    // The credential file is envelope-encrypted at rest; neither the access
+    // nor the refresh token must appear in plaintext on disk.
+    const envelope = JSON.parse(raw);
+    expect(envelope).toMatchObject({ v: 2, alg: 'AES-256-GCM' });
+    expect(typeof envelope.iv).toBe('string');
+    expect(typeof envelope.ct).toBe('string');
+    expect(raw).not.toContain('shared-access-token');
+    expect(raw).not.toContain('shared-refresh-token');
 
     const restored = createMcodeSharedAuthSession({
       dataDir,

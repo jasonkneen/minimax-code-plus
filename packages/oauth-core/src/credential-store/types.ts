@@ -38,8 +38,8 @@ export interface CredentialStore {
 export class CredentialRecordCorruptError extends Error {
   readonly code = 'CREDENTIAL_RECORD_CORRUPT';
 
-  constructor() {
-    super('The stored OAuth credential record is invalid.');
+  constructor(message?: string) {
+    super(message ?? 'The stored OAuth credential record is invalid.');
     this.name = 'CredentialRecordCorruptError';
   }
 }
