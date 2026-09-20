@@ -1,6 +1,8 @@
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 
+import { sanitizeBashSubprocessEnv } from '@mavis/agent-core/bash-subprocess-env';
+
 import type {
   LocalFileDiff,
   LocalTurnDiffRecord,
@@ -411,7 +413,12 @@ function applyGitPatch(input: {
 }
 
 function cleanGitEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
+  // `git apply` is a bash-adjacent subprocess: passing `process.env` through
+  // would leak `MAVIS_ACCESS_TOKEN` / `MATRIX_TOKEN` / `*_API_KEY` into the
+  // child. Route through the shared sanitizer (scrub mode) so the env is
+  // always stripped before reaching git, then layer the GIT_* reset on top
+  // to avoid the worktree picking up the parent's repository context.
+  const { env } = sanitizeBashSubprocessEnv(process.env, { mode: 'scrub' });
   delete env['GIT_DIR'];
   delete env['GIT_WORK_TREE'];
   delete env['GIT_INDEX_FILE'];

@@ -2,6 +2,8 @@ import { execFile as execFileCallback, spawn, type ExecFileException } from 'nod
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 
+import { sanitizeBashSubprocessEnv } from '@mavis/agent-core/bash-subprocess-env';
+
 import { WorkspaceGitCommandError } from '../contracts.js';
 
 const execFile = promisify(execFileCallback);
@@ -129,7 +131,12 @@ export function requireGitSuccess(
 }
 
 function gitEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
+  // Workspace git operations are bash-adjacent subprocesses — passing
+  // `process.env` through would leak `MAVIS_ACCESS_TOKEN` / `MATRIX_TOKEN` /
+  // `*_API_KEY` into the child git process. Route through the shared
+  // sanitizer (scrub mode) and additionally strip the GIT_* namespace so the
+  // spawned git does not pick up a parent's repository/worktree context.
+  const { env } = sanitizeBashSubprocessEnv(process.env, { mode: 'scrub' });
   for (const key of Object.keys(env)) {
     if (key.startsWith('GIT_')) delete env[key];
   }

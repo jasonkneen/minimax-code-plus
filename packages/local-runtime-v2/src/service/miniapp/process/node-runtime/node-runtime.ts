@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { sanitizeBashSubprocessEnv } from '@mavis/agent-core/bash-subprocess-env';
+
 import type {
   MiniAppHostConnectorSession,
   MiniAppHostConnectorSessionFactory,
@@ -771,11 +773,18 @@ async function stopAttempt(
 }
 
 function resolveOptions(options: NodeRuntimeOptions): ResolvedOptions {
+  // Default to a sanitized env so the miniapp host-runner child never
+  // inherits `MAVIS_ACCESS_TOKEN` / `MATRIX_TOKEN` / `*_API_KEY` from the
+  // desktop parent via `process.env`. The whitelist in `runnerEnvironment`
+  // narrows this further (PATH, HOME, TMP, …) before the actual spawn, but
+  // scrubbing here ensures the wider env is never exposed even if the
+  // whitelist drifts. Test override paths can still pass `options.env`
+  // explicitly.
   const defaults = {
     execPath: process.execPath,
     runnerPath: fileURLToPath(new URL('./host-runner.js', import.meta.url)),
     platform: process.platform,
-    env: process.env,
+    env: sanitizeBashSubprocessEnv(process.env, { mode: 'scrub' }).env,
     spawn: nodeSpawn,
     connectPort: connectMiniAppPort,
     createTerminator: createDirectNodeRootTerminator,
@@ -864,6 +873,18 @@ function runnerEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     if (env[key] !== undefined) result[key] = env[key];
   }
   return result;
+}
+
+/**
+ * Build the env passed to the host-runner child.
+ *
+ * @internal Not part of the public API; exported for testability of the
+ * env-scrubbing contract without forcing tests to drive the full prepare
+ * flow (filesystem state, port reservation, IPC handshake).
+ */
+export function buildHostRunnerEnv(inputEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const { env } = sanitizeBashSubprocessEnv(inputEnv, { mode: 'scrub' });
+  return runnerEnvironment(env);
 }
 
 function connectMiniAppPort(input: TcpConnectInput): Promise<void> {
