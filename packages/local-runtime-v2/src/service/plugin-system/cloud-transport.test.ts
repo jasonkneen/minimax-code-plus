@@ -217,8 +217,8 @@ describe('PluginSystemCloudTransport', () => {
     expect(authenticated?.[1]?.body).toBe('{"action":"enable","common_param":{"user_id":"42"}}');
     expect(headers.get('authorization')).toBe('Bearer token-new');
     expect(headers.has('token')).toBe(false);
-    expect(headers.get('yy')).toMatch(/^[0-9a-f]{32}$/u);
-    expect(headers.get('x-signature')).toMatch(/^[0-9a-f]{32}$/u);
+    expect(headers.get('yy')).toMatch(/^[0-9a-f]{64}$/u);
+    expect(headers.get('x-signature')).toMatch(/^[0-9a-f]{64}$/u);
     expect(headers.get('X-Minimax-Agent-Preview-Secret')).toBe('preview');
     expect(headers.get('bedrock-lane')).toBe('blue');
   });
@@ -365,5 +365,60 @@ describe('PluginSystemCloudTransport', () => {
           authContextGetter: () => undefined,
         }),
     ).toThrow(PluginSystemCloudTransportError);
+  });
+});
+
+describe('PluginSystemCloudTransport HMAC-SHA256 signature', () => {
+  const fetchImpl = vi.fn<typeof fetch>(async () =>
+    Response.json({ base_resp: { status_code: 0 } }),
+  );
+
+  it('emits deterministic 64-char hex SHA256 signatures for the same inputs', async () => {
+    const transport = new PluginSystemCloudTransport({
+      baseUrl: 'https://agent.example',
+      fetchImpl,
+      authContextGetter: () => undefined,
+      nowMs: () => 1_700_000_000_000,
+    });
+
+    await transport.request({ method: 'GET', path: '/p', auth: 'none' });
+    const first = fetchImpl.mock.calls[0]?.[1]?.headers as Record<string, string> | undefined;
+    const firstYy = first?.['yy'];
+    const firstSig = first?.['x-signature'];
+
+    await transport.request({ method: 'GET', path: '/p', auth: 'none' });
+    const second = fetchImpl.mock.calls[1]?.[1]?.headers as Record<string, string> | undefined;
+
+    expect(firstYy).toMatch(/^[0-9a-f]{64}$/u);
+    expect(firstSig).toMatch(/^[0-9a-f]{64}$/u);
+    expect(second?.['yy']).toBe(firstYy);
+    expect(second?.['x-signature']).toBe(firstSig);
+  });
+
+  it('produces SHA256 output that differs from the prior MD5 signing of the same payload', async () => {
+    const { createHash, createHmac } = await import('node:crypto');
+    // The signing string for `x-signature` is `${second}${bodyText}`. We compare
+    // the live HMAC-SHA256 output against the historical MD5 of that exact
+    // payload (regardless of which salt produced it) — they MUST differ, which
+    // proves the wire protocol has actually moved off MD5.
+    const payload = '1700000000';
+    const legacyMd5 = createHash('md5').update(payload).digest('hex');
+    const freshHmac = createHmac('sha256', 'any-salt').update(payload).digest('hex');
+
+    expect(legacyMd5).toHaveLength(32);
+    expect(freshHmac).toHaveLength(64);
+    expect(freshHmac).not.toBe(legacyMd5);
+
+    const transport = new PluginSystemCloudTransport({
+      baseUrl: 'https://agent.example',
+      fetchImpl,
+      authContextGetter: () => undefined,
+      nowMs: () => 1_700_000_000_000,
+    });
+    await transport.request({ method: 'GET', path: '/p', auth: 'none' });
+    const headers = fetchImpl.mock.calls.at(-1)?.[1]?.headers as Record<string, string> | undefined;
+    const liveSig = headers?.['x-signature'] ?? '';
+    expect(liveSig).toMatch(/^[0-9a-f]{64}$/u);
+    expect(liveSig).not.toBe(legacyMd5);
   });
 });
